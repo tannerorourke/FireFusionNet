@@ -1,0 +1,21 @@
+# Byte-compiled files
+__pycache__/
+
+# Downloaded Data (~160gb)
+data/**
+
+# specific files
+build/
+*.zip
+*.gzip
+*.accdb
+*.7z
+*.tar.gz
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environments
+.env
+.venv
+.vscode
