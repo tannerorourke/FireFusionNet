@@ -21,7 +21,7 @@ def read_hdf_file(subdataset: str, var = None):
 
     if "band" in data.dims and data.sizes.get("band", 1) == 1:  # type: ignore
         data = data.squeeze("band")  # type: ignore
-    data.name = np.var # type: ignore
+    data.name = var # type: ignore
     return data
 
 
@@ -80,8 +80,8 @@ def load_as_xarr(
     """
     suffix = file.suffix.lower()
 
-    # Landfire, GPWv4
-    if suffix == ".tif":
+    # Landfire, GPWv4, NLCD
+    if suffix in {".tif", ".tiff"}:
         try:
             darr = rioxarray.open_rasterio(file, masked=True)
 
@@ -91,33 +91,19 @@ def load_as_xarr(
             print(f"[LOAD_AS_XARR] Failed to load tif '{file.stem}': ", e)
             return xr.DataArray()
 
-    # NLCD
-    if suffix == ".tiff":
-        try:
-            darr = rioxarray.open_rasterio(file, masked=True)   
-            if "band" in darr.dims and darr.sizes.get("band", 1) == 1: # type: ignore
-                darr = darr.squeeze("band") # type: ignore
-        except Exception as e:
-            print(f"[LOAD_AS_XARR] Failed to load tiff '{file.stem}': ", e)
-            return xr.DataArray()
-
-        
     # gridMET
     elif suffix == ".nc":
         try:
-            ds = xr.open_dataarray(file, 
-                engine="netcdf4", 
-                # decode_coords="all",
-                # decode_times=True
-            )
-            
-            print("raw encoding:", ds.encoding)
-            if variable is None:
-                raise ValueError(f"[LOAD_AS_XARR] expects variable. Options are: {list(ds.data_vars.keys())}")
-            # if variable not in ds:
-            #     raise KeyError(f"{variable} not in dataset. Available: {list(ds.data_vars.keys())}")
-            darr = ds
-            del ds
+            ds = xr.open_dataset(file, engine="netcdf4")
+
+            if variable is not None and variable in ds.data_vars:
+                darr = ds[variable]
+            elif len(ds.data_vars) == 1:
+                darr = ds[list(ds.data_vars)[0]]
+            else:
+                raise ValueError(
+                    f"[LOAD_AS_XARR] '{file.stem}' needs a variable. Options are: {list(ds.data_vars.keys())}"
+                )
         except Exception as e:
             print(f"[LOAD_AS_XARR] Failed to load nc '{file.stem}': ", e)
             return xr.DataArray()
@@ -127,14 +113,18 @@ def load_as_xarr(
         try:
             if grid is None or variable is None:
                 raise ValueError("[LOAD_AS_XARR] expects variable and grid for .hdf files")
-            
+
             with rasterio.open(file) as src:
                 sds = src.subdatasets
                 if not sds: raise ValueError("No hdf5 subdatasets")
 
+            darr = None
             for sd in sds:
                 if sd.endswith(f":{variable}"):
                     darr = read_hdf_file(sd, variable)
+                    break
+            if darr is None:
+                raise ValueError(f"No subdataset ending with ':{variable}' in {file.name}")
 
         except Exception as e:
             print(f"[LOAD_AS_XARR] Failed to load hdf '{file.stem}': ", e)
@@ -162,7 +152,7 @@ def load_as_xarr(
             print(f"[LOAD_AS_XARR] Failed to load hdf5 '{file.stem}': ", e)
             return xr.DataArray()
     else:
-        print("why am I here")
+        raise ValueError(f"[LOAD_AS_XARR] Unsupported file type '{suffix}' for {file.name}")
 
     if no_data_val is not None:
         darr = darr.where(darr != no_data_val, other=np.nan) # type: ignore

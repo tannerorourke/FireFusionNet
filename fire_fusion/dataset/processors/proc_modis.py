@@ -20,11 +20,15 @@ class Modis(Processor):
     def __init__(self, cfg, master_grid):
         super().__init__(cfg, master_grid)
 
-        self.auth = earthaccess.login(strategy="netrc", persist=True)
-        if self.auth.username:
+        # Login is only required when granules must be fetched; cached-local
+        # builds should not depend on network credentials
+        try:
+            self.auth = earthaccess.login(strategy="netrc", persist=True)
+        except Exception as e:
+            self.auth = None
+            print(f"[LAADS] Earthdata login unavailable ({e}); only locally cached granules can be used")
+        if self.auth is not None and self.auth.username:
             print(f"Logged into EARTH DATA for {self.auth.username}")
-        else:
-            raise AuthenticationError("EARTH DATA credentials via root _netrc file not found")
         
         self.latlon_tup = (
             self.gridref.attrs['lon_min'], self.gridref.attrs['lat_min'],
@@ -121,7 +125,7 @@ class Modis(Processor):
                 arr = self._preclip_native_dataset(raw)
                 arr = self._reproject_dataset_to_mgrid(arr, f_cfg.resampling)
 
-                lai  = arr["Lai_500m"].fillna(0).astype("float32")
+                lai  = arr["Lai_500m"].astype("float32")
                 qc   = arr["FparLai_QC"].fillna(0).astype("uint8")
                 qcx  = arr["FparExtra_QC"].fillna(0).astype("uint8")
 
@@ -146,8 +150,10 @@ class Modis(Processor):
                     island & not_snow & no_clouds & atm_good
                 )
 
-                # Drop fill cal 255 and non-terrestrial 249
+                # Drop fill values 249-255 (kept in DN space), then apply the
+                # MCD15A2H 0.1 scale factor so LAI lands in physical 0-10 range
                 lai = lai.where((lai >= 0) & (lai <= 100))
+                lai = lai * 0.1
 
             lai = lai.expand_dims(time=[ts])
             year_data.append(lai)
@@ -230,9 +236,12 @@ class Modis(Processor):
         stacked_ndvi = xr.concat(year_data_ndvi, dim="time").sortby("time").groupby("time").max("time")
         stacked_wmask = xr.concat(year_data_water, dim="time").sortby("time").groupby("time").max("time")
 
+        # Forward fill to daily, then extend through Dec 31 by holding the last
+        # composite (resample alone stops at the final composite date)
         ys, ye = f"{year}-01-01", f"{year}-12-31"
-        stacked_ndvi = stacked_ndvi.resample(time="1D").ffill().sel(time=slice(ys, ye))
-        stacked_wmask = stacked_wmask.resample(time="1D").ffill().sel(time=slice(ys, ye))
+        full_days = pd.date_range(ys, ye, freq="D")
+        stacked_ndvi = stacked_ndvi.resample(time="1D").ffill().reindex(time=full_days, method="ffill")
+        stacked_wmask = stacked_wmask.resample(time="1D").ffill().reindex(time=full_days, method="ffill")
 
         assert f_cfg.expand_names is not None, "expected f_cfg.expand_names"
 
@@ -370,8 +379,11 @@ class Modis(Processor):
         clip_end   = pd.Timestamp(max(self.gridref.attrs['years']), 12, 31)
         months_since = months_since.sel(time=slice(clip_start, clip_end))
 
-        # Convert monthly to daily with forward fill
+        # Convert monthly to daily with forward fill; reindex extends past the
+        # last month start through the end of the record (resample stops there)
         months_since = months_since.resample(time="1D").ffill()
+        full_days = pd.date_range(clip_start, clip_end, freq="D")
+        months_since = months_since.reindex(time=full_days, method="ffill")
         months_since.name = f_cfg.name
         months_since = months_since.to_dataset(name=f_cfg.name)
 
@@ -428,10 +440,15 @@ class Modis(Processor):
         product_folder = MODIS_DIR / f"{short_name}.{year}"
         ex_files = list(product_folder.glob("*.hdf"))
 
-        if ex_files and all([True for f in ex_files if f.name.startswith(f"{short_name}")]):
+        if ex_files and all(f.name.startswith(short_name) for f in ex_files):
             # print(f"[LAADS] {short_name} Found my yearbook from {year}, DAMN I look good..")
             return ex_files
-        
+
+        if self.auth is None or not self.auth.username:
+            raise AuthenticationError(
+                f"[LAADS] {short_name} {year} is not cached locally and no EARTH DATA credentials are available"
+            )
+
         comb_results = []
         for tile in self.tiles:
             wildcard = self._granule_pattern(short_name, tile)

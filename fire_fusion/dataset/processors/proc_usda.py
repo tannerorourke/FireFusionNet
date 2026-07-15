@@ -27,6 +27,7 @@ class UsdaWui(Processor):
         ]
 
         self.geo_block = None
+        self.wui_index = None
 
     def _load_geo_block(self, fp: Path) -> gpd.GeoDataFrame:
         obj_slice = gpd.read_file(fp, engine="pyogrio", layer=self.layer_name, rows=slice(0, 1))
@@ -67,15 +68,16 @@ class UsdaWui(Processor):
 
         # Drop water polygons
         if "WATER20" in obj.columns:
-            obj_clipped = obj.loc[obj["WATER20"] != 1].copy()
-        
-        return obj_clipped[self.data_cols].copy()
+            obj = obj.loc[obj["WATER20"] != 1].copy()
+
+        return obj[self.data_cols].copy()
 
     def _reindex_drop_cols(self, block: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-        """ Add re-indexed columns, Drop the rest """
-        to_drop = [c for c in self.data_cols if c in block.columns]
-
+        """ Add re-indexed WUI columns, drop the raw class columns
+            (geometry and HUDEN columns stay; rasterization needs them)
+        """
         try:
+            to_drop = []
             for year in (2000, 2010, 2020):
                 reindex_col = f"WUI_INDEX_{year}"
                 class_col = f"WUICLASS{year}"
@@ -86,7 +88,7 @@ class UsdaWui(Processor):
                 )
                 to_drop.append(class_col)
 
-            block.drop(columns=to_drop)
+            block = block.drop(columns=[c for c in to_drop if c in block.columns])
             return block
         except Exception as e:
             raise LookupError(f"[USDA WUI] Issue reindexing/dropping columns", e)

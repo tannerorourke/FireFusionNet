@@ -139,7 +139,7 @@ def base_feat_config():
             Feature(
                 name = "temp_avg",
                 key = "tmm",
-                clip = (0.0, 120.0), #Far
+                clip = (-40.0, 120.0), #Far
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
                 ds_norms = ["z_score"],
@@ -157,7 +157,9 @@ def base_feat_config():
                 key = "th",
                 clip = (0.0, 360.0),
                 resampling = Resampling.bilinear,
-                time_interp = ("existing", "linear"),
+                # nearest: linear interpolation of a raw angle blends through
+                # 180 degrees on 359->1 wraparounds
+                time_interp = ("existing", "nearest"),
                 # dropped
             ),
             Feature(
@@ -220,7 +222,8 @@ def base_feat_config():
             Feature(
                 name = "usda_wui_index",
                 key = "wui_index",
-                time_interp = ("existing", "linear"),
+                # nearest: the index is ordinal; linear blends across classes
+                time_interp = ("existing", "nearest"),
                 ds_norms = ["z_score"]
             ),
             Feature(
@@ -234,7 +237,7 @@ def base_feat_config():
             Feature(
                 name = "pop_density",
                 resampling = Resampling.nearest,
-                time_interp = ("broadcast", "linear"),
+                time_interp = ("existing", "linear"),
                 ds_clip = (0.0, np.inf),
                 ds_norms=["log1p", "z_score"]
             )
@@ -290,6 +293,7 @@ def base_feat_config():
                 # 0/1 is ordinal
                 resampling = Resampling.nearest,
                 # NO TIME INTERPOLATION, forward fill in proc_modis
+                ds_norms = ["z_score"],
             ),
         ],
         
@@ -307,14 +311,14 @@ def base_feat_config():
                 name = "frac_imp_surface",
                 key = "FctImp",
                 resampling = Resampling.bilinear,
-                time_interp = ("broadcast", "linear"),
+                time_interp = ("existing", "linear"),
                 ds_clip = (0.0, 1.0),
             ),
             Feature(
                 name = "canopy_cover_pct",
                 key = "tccconus",
                 resampling = Resampling.bilinear,
-                time_interp = ("broadcast", "linear"),
+                time_interp = ("existing", "linear"),
                 ds_clip = (0.0, 1.0),
             )
         ],
@@ -368,7 +372,9 @@ def drv_feat_config() -> List[Feature]:
             func = "build_ndvi_anomaly",
             inputs=["modis_ndvi"],
             drop_inputs=["modis_ndvi"],
-            ds_clip=(-0.1, 1.0),
+            # symmetric clip: negative anomalies (drier than climatology) carry
+            # the fire-relevant signal
+            ds_clip=(-1.0, 1.0),
             ds_norms = ["z_score"],
         ),
         Feature(expand_names = ["precip_2d", "precip_5d"],

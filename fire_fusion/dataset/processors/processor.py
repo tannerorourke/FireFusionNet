@@ -154,8 +154,10 @@ class Processor:
                 expanded = single.expand_dims(dim={ "time": time_index })
                 expanded = expanded.assign_coords(time=time_index)
                 return expanded
-            
-            return source_ds
+
+            # Multiple source timestamps: align onto the master index (a raw
+            # return would leak foreign time coords into the outer merge)
+            return source_ds.reindex(time=time_index, method="nearest")
 
         elif interp_type == "existing":
             if "time" not in source_ds.dims:
@@ -167,6 +169,11 @@ class Processor:
             # Ensure increasing order for interpolation
             feature_sorted = source_ds.sortby("time")
             interp = feature_sorted.interp(time=time_index, method=interp_method)
+
+            # interp() does not extrapolate; days outside the source's coverage
+            # hold the nearest edge observation instead of going NaN
+            edge = feature_sorted.reindex(time=time_index, method="nearest")
+            interp = interp.fillna(edge)
 
             for name, da in interp.data_vars.items():
                 print("post-interp", name,
