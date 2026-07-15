@@ -28,15 +28,22 @@ def create_coordinate_grid(
         crs_to=crs_obj, 
         always_xy=True
     )
-    min_x, min_y = transformer.transform(min_lon, min_lat)
-    max_x, max_y = transformer.transform(max_lon, max_lat)
+    # UTM edges bow with latitude; take the envelope of all four corners so the
+    # grid fully covers the requested lat/lon rectangle
+    corner_xs, corner_ys = transformer.transform(
+        [min_lon, max_lon, min_lon, max_lon],
+        [min_lat, min_lat, max_lat, max_lat],
+    )
+    min_x, max_x = min(corner_xs), max(corner_xs)
+    min_y, max_y = min(corner_ys), max(corner_ys)
 
     width_m = max_x - min_x
     height_m = max_y - min_y
 
-    # num of pixels in each direction
-    npx_x = int(np.ceil(width_m / resolution))
-    npx_y = int(np.ceil(height_m / resolution))
+    # num of pixels in each direction, rounded up to multiples of 4 so the
+    # model's stride-2 stages and 2x2 window partitions divide evenly
+    npx_x = int(np.ceil(np.ceil(width_m / resolution) / 4) * 4)
+    npx_y = int(np.ceil(np.ceil(height_m / resolution) / 4) * 4)
 
     # Snap upper-right corner to exact pixel grid
     max_x_aligned = min_x + npx_x * resolution

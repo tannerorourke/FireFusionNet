@@ -14,7 +14,7 @@ class Landfire(Processor):
         super().__init__(cfg, mgrid)
 
     def build_feature(self, f_cfg: Feature):
-        feature_by_year = xr.Dataset()
+        yearly_arrs: List[xr.DataArray] = []
 
         for folder in LANDFIRE_DIR.iterdir():
             folder_path = (LANDFIRE_DIR / folder.name)
@@ -42,8 +42,9 @@ class Landfire(Processor):
             if "time" not in arr.dims:
                 arr = arr.expand_dims(time=[ts]).assign_coords(time=[ts])
 
-            feature_by_year[f_cfg.name] = arr
-            
+            yearly_arrs.append(arr)
+
+        feature_by_year = xr.concat(yearly_arrs, dim="time").to_dataset(name=f_cfg.name)
         feature_by_year = feature_by_year.sortby("time")
         feature_by_year = self._time_interpolate(feature_by_year, f_cfg.time_interp)
         feature_by_year = feature_by_year.transpose("time", "y", "x", ...)

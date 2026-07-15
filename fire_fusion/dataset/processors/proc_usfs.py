@@ -78,9 +78,17 @@ class UsfsFire(Processor):
         val = str(raw).strip().lower()
         if val == "":
             return np.nan
-        for kls, keywords in CAUSE_RAW_MAP.items():
-            for kw in keywords:
-                if kw in val:
+
+        # Values arrive as bare codes ("5"), bare text ("debris burning"), or
+        # "code - text" combos; match whole tokens only, numeric code first
+        candidates = [val]
+        if "-" in val:
+            code, _, text = val.partition("-")
+            candidates += [code.strip(), text.strip()]
+
+        for cand in candidates:
+            for kls, keywords in CAUSE_RAW_MAP.items():
+                if cand in keywords:
                     return kls
         return np.nan
     
@@ -130,7 +138,7 @@ class UsfsFire(Processor):
 
         # === Fire Cause
         cause_labels = pd.Index(CAUSAL_CLASSES, name="burn_cause")
-        cause_grid = time_grid = np.zeros((
+        cause_grid = np.zeros((
             len(self.mt_ix), len(cause_labels), 
             len(self.gridref.y), len(self.gridref.x)
         ), dtype="uint8")
@@ -185,8 +193,6 @@ class UsfsFire(Processor):
 
         fire_occurences = self.occ_cause_layer["usfs_burn_cause"]
 
-        cumulative_occurences = fire_occurences.cumsum(dim="time")
-
         # Sigma = how wide the bell curve is IN 2d PIXELS = equals average of X/Y pixel
         # Radius = max radius of filter influence in meters (coordinates)
         px_size_xkm = float(abs(self.gridref.rio.transform().a) / 1000)
@@ -200,34 +206,34 @@ class UsfsFire(Processor):
         
         print(f"sigma pixels = {kde_radius} / {pixel_size_km} = {sigma_pixels}")
         
-        # Loop over burn causes, computing gaussian filter for each class
+        # Loop over burn causes, computing gaussian filter for each class.
+        # Each timestep's map only accumulates fires observed up to that day:
+        # smoothing is linear, so smoothing daily occurrences and cumsum-ing over
+        # time is identical to smoothing the running cumulative map at every day
         kde_by_class = {}
         for cause in fire_occurences.coords["burn_cause"].values:
-            # select burn cause dimension at all times for (burn cause, T)
-            cause_2d = cumulative_occurences.sel(burn_cause=cause).isel(time=-1).values.astype("float32")
+            occ_txy = fire_occurences.sel(burn_cause=cause).values.astype("float32")
 
-            if cause_2d.sum() == 0:
+            if occ_txy.sum() == 0:
                 print(f"WARNING: Sum of All X/Y across time is 0 for {cause}")
-                smoothed = cause_2d
+                kde_txy = occ_txy
             else:
-                # Sigma = sigma=(0, sigma, sigma) >> smooth over X/Y, NOT TIME DIM
-                smoothed = gaussian_filter(
-                    cause_2d,
-                    # sigma=(0.0, sigma_pixels, sigma_pixels),
-                    sigma=sigma_pixels,
-                    mode="constant"
-                )
+                smoothed = np.zeros_like(occ_txy)
+                fire_days = np.flatnonzero(occ_txy.reshape(occ_txy.shape[0], -1).sum(axis=1) > 0)
+                for t in fire_days:
+                    smoothed[t] = gaussian_filter(occ_txy[t], sigma=sigma_pixels, mode="constant")
+                kde_txy = np.cumsum(smoothed, axis=0, dtype="float32")
 
             da_kde = xr.DataArray(
-                smoothed,
+                kde_txy,
                 coords={
-                    "y": fire_occurences.coords["y"], 
+                    "time": fire_occurences.coords["time"],
+                    "y": fire_occurences.coords["y"],
                     "x": fire_occurences.coords["x"],
                 },
-                dims=("y", "x"),
+                dims=("time", "y", "x"),
                 name=f"kde_{str(cause).lower()}"
             )
-            da_kde = da_kde.expand_dims({ "time": fire_occurences.coords["time"] })
             kde_by_class[f"kde_{str(cause).lower()}"] = da_kde
 
         kde_ds = xr.Dataset(kde_by_class)
