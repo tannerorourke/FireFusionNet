@@ -29,6 +29,9 @@ class CensusRoads(Processor):
         
         print(f"Informing tensors to stop whining.. MORE DATA!")
 
+        # TIGER/Line ships in NAD83 degrees; clip bounds are in grid (UTM meter) space
+        roads = roads.to_crs(self.mCRS)
+
         roads = gpd.clip(roads, box(
             self.gridref.attrs['x_min'], self.gridref.attrs['y_min'],
             self.gridref.attrs['x_max'], self.gridref.attrs['y_max']

@@ -65,6 +65,11 @@ class FeatureGrid:
         print("labels: ", self.label_names)
         print("masks: ", self.mask_names)
 
+        # Split boundaries; normalization statistics are computed on the train years only
+        self.train_yrs = (2009, 2016)
+        self.eval_yrs = (2017, 2018)
+        self.test_yrs = (2019, 2020)
+
         self.time_index = pd.date_range(start_date, end_date, freq="D")
         self.grid = create_coordinate_grid(
             self.time_index,
@@ -106,26 +111,40 @@ class FeatureGrid:
     
 
     def _apply_normalize(self) -> None:
+        # Statistics come from finite train-split cells only, and are re-computed
+        # after each step in the norm chain so stacked transforms compose correctly
+        train_slice = slice(f"{self.train_yrs[0]}-01-01", f"{self.train_yrs[1]}-12-31")
+
+        def _train_stats(da: xr.DataArray):
+            src = da.sel(time=train_slice) if "time" in da.dims else da
+            ff = src.where(np.isfinite(src))
+            return (
+                float(ff.mean(skipna=True)),
+                float(ff.std(skipna=True)),
+                float(ff.min(skipna=True)),
+                float(ff.max(skipna=True)),
+            )
+
         for f in self.master_ds.data_vars:
             if f in self.mask_names or f in self.label_names:
                 continue
-            
+
             # find config
             feature = self.master_ds[f]
-            f_config = next((cfg for 
+            f_config = next((cfg for
                 cfg in (
-                    [c for fl in base_feat_config().values() 
-                        for c in fl 
+                    [c for fl in base_feat_config().values()
+                        for c in fl
                             if (c.name == f or f in (c.expand_names or []))
                     ] + [
-                        c for c in drv_feat_config() 
+                        c for c in drv_feat_config()
                             if (c.name == f or f in (c.expand_names or []))
                     ]
                 )
             ), None)
 
             if f_config is None:
-                print(f"can't find feature")
+                print(f"can't find feature config for '{f}'")
                 continue
 
             print(f"[FeatureGrid] normalizing {f_config.name if f_config.name else f_config.expand_names}")
@@ -133,26 +152,23 @@ class FeatureGrid:
             clip = getattr(f_config, "ds_clip", None)
             if clip is not None:
                 feature = feature.clip(clip[0], clip[1])
-            
-            ff = feature.where(np.isfinite(feature))
-            f_mean = float(ff.mean(dim=ff.dims, skipna=True))
-            f_std = float(ff.std(dim=ff.dims, skipna=True))
-            f_min = float(ff.min(dim=ff.dims, skipna=True))
-            f_max = float(ff.max(dim=ff.dims, skipna=True))
 
             norms = getattr(f_config, "ds_norms", None)
             if norms is not None:
                 for ntype in norms:
-                    if ntype == "z_score":
-                        feature = (feature - f_mean) / (f_std if f_std > 0 else 1.0)
-                    elif ntype == "minmax":
-                        denom = abs(f_max - f_min)
-                        feature = (feature - f_min) / (denom if denom > 0.0 else 1.0)
-                    elif ntype == "log1p":
+                    if ntype == "log1p":
                         feature = xr.apply_ufunc(np.log1p, feature)
                     elif ntype == "to_sin":
                         feature = xr.apply_ufunc(np.sin, feature)
+                    elif ntype == "z_score":
+                        f_mean, f_std, _, _ = _train_stats(feature)
+                        feature = (feature - f_mean) / (f_std if f_std > 0 else 1.0)
+                    elif ntype == "minmax":
+                        _, _, f_min, f_max = _train_stats(feature)
+                        denom = abs(f_max - f_min)
+                        feature = (feature - f_min) / (denom if denom > 0.0 else 1.0)
                     elif ntype == "scale_max":
+                        _, _, _, f_max = _train_stats(feature)
                         feature = feature / (f_max if f_max != 0 else 1.0)
 
             self.master_ds[f] = feature
@@ -193,12 +209,9 @@ class FeatureGrid:
         print(f"- dims: {self.master_ds.dims}")
 
     
-    def _save_splits_to_zarr(self, 
-        train_yrs=(2009, 2016),
-        eval_yrs=(2017, 2018),
-        test_yrs=(2019, 2020),
-    ) -> None:
-        print("Spraying neutrino stabilization goo in sub-basement level 7...") 
+    def _save_splits_to_zarr(self) -> None:
+        print("Spraying neutrino stabilization goo in sub-basement level 7...")
+        train_yrs, eval_yrs, test_yrs = self.train_yrs, self.eval_yrs, self.test_yrs
  
         t = self.master_ds.time
         years = t.dt.year.values
@@ -241,10 +254,11 @@ class FeatureGrid:
 
 
     def _print_class_imbalance(self):
-        ign  = self.master_ds[self.label_names[0]]
-        fire_mask = self.master_ds[self.mask_names[0]]
-        water_mask = self.master_ds[self.mask_names[1]]
+        ign  = self.master_ds["ign_next"]
+        fire_mask = self.master_ds["act_fire_mask"]
+        water_mask = self.master_ds["water_mask"]
 
+        # land pixels (water_mask: 1 = water) that are not already burning
         ign_valid = ign.where((water_mask == 0) & (fire_mask == 1))
         n_ign_pos = (ign_valid == 1).sum().compute().item()
         n_ign_neg = (ign_valid == 0).sum().compute().item()
@@ -270,32 +284,31 @@ class FeatureGrid:
                     layer = processor.build_feature(config)
                 except Exception as e:
                     print(f"Oh no! feature extraction failed for {config.name}: ", e)
-                    return
-                try:
-                    if isinstance(layer, xr.DataArray):
-                        layers.append(f)
-                    else:
-                        for name, f in layer.items():
-                            ff = f.where(np.isfinite(f))
-                            print(f"Adding {f.name}...")
-                            f_min = float(ff.min(skipna=True))
-                            f_max = float(ff.max(skipna=True))
-                            f_mean = float(ff.mean(skipna=True))
-                            f_std = float(ff.std(skipna=True))
-                            total = f.size
-                            finite = int(np.isfinite(f).sum())
-                            frac_finite = finite / float(total) if total > 0 else 0.0
-                            print(
-                                f"  {f.name:25s} "
-                                f"min={f_min:10.4f} max={f_max:10.4f} "
-                                f"mean={f_mean:10.4f} std={f_std:10.4f} "
-                                f"finite={finite:,}/{total:,} ({frac_finite:6.2%})"
-                            )
-                            layers.append(f)
+                    raise
 
-                except Exception as e:
-                    print(f"Oh no! feature stats failed for {config.name}: ", e)
-                    return
+                if isinstance(layer, xr.DataArray):
+                    layer = layer.to_dataset(name=layer.name or config.name)
+
+                for name, f in layer.items():
+                    layers.append(f)
+                    try:
+                        ff = f.where(np.isfinite(f))
+                        print(f"Adding {f.name}...")
+                        f_min = float(ff.min(skipna=True))
+                        f_max = float(ff.max(skipna=True))
+                        f_mean = float(ff.mean(skipna=True))
+                        f_std = float(ff.std(skipna=True))
+                        total = f.size
+                        finite = int(np.isfinite(f).sum())
+                        frac_finite = finite / float(total) if total > 0 else 0.0
+                        print(
+                            f"  {f.name:25s} "
+                            f"min={f_min:10.4f} max={f_max:10.4f} "
+                            f"mean={f_mean:10.4f} std={f_std:10.4f} "
+                            f"finite={finite:,}/{total:,} ({frac_finite:6.2%})"
+                        )
+                    except Exception as e:
+                        print(f"(stats print failed for {name}: {e})")
 
         self._print_debug_stats("pre_merge")
 
@@ -303,17 +316,19 @@ class FeatureGrid:
         try:
             self.master_ds: xr.Dataset = xr.merge(layers, join="outer")
         except Exception as e:
-            print(f"Oh no! merging failed for {config.name}: ", e)
-            return
+            print(f"Oh no! merging failed: ", e)
+            raise
         del layers
 
         self._print_debug_stats("after_merge")
         self._apply_derived()
         self._print_debug_stats("after_derived_features")
-        self._apply_mask_nan()
-        self._print_debug_stats("after_nan mask")
+        # Normalize while missing cells are still NaN, so statistics only see
+        # valid observations; the zero-fill afterwards lands on the post-norm mean
         self._apply_normalize()
         self._print_debug_stats("after_normalization")
+        self._apply_mask_nan()
+        self._print_debug_stats("after_nan mask")
         self._print_class_imbalance()
         # self._save_splits_to_pt()
         self._save_splits_to_zarr()

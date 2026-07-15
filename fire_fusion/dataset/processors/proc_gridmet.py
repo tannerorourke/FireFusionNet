@@ -40,15 +40,23 @@ class GridMet(Processor):
         if f_cfg.key in ["tmm", "rm"]: # read in pairs of two
             yr_groups = self.group_by_year(f_cfg.key)
 
+            def _pick(files, prefix: str):
+                fp = next((f for f in files if f.stem.startswith(prefix)), None)
+                if fp is None:
+                    raise FileNotFoundError(
+                        f"[gridMET] Missing '{prefix}*' file among {[f.name for f in files]}"
+                    )
+                return fp
+
             for (year, files) in sorted(yr_groups.items()):
                 if f_cfg.key == "tmm":
                     print(f"[gridMET] Creating temperature gradient with unorthodox methods for {year}..")
-                    vmin = load_as_xarr(files[0], name=f_cfg.name, variable='air_temperature')
-                    vmax = load_as_xarr(files[1], name=f_cfg.name, variable='air_temperature')
+                    vmin = load_as_xarr(_pick(files, "tmmn"), name=f_cfg.name, variable='air_temperature')
+                    vmax = load_as_xarr(_pick(files, "tmmx"), name=f_cfg.name, variable='air_temperature')
                 elif f_cfg.key == "rm":
                     print(f"[gridMET] Retrieving humidity data for {year}; atmosphere refusing to disclose exact moisture..")
-                    vmin = load_as_xarr(files[0], name=f_cfg.name, variable='relative_humidity')
-                    vmax = load_as_xarr(files[1], name=f_cfg.name, variable='relative_humidity')
+                    vmin = load_as_xarr(_pick(files, "rmin"), name=f_cfg.name, variable='relative_humidity')
+                    vmax = load_as_xarr(_pick(files, "rmax"), name=f_cfg.name, variable='relative_humidity')
 
                 arr_min = self._preclip_native_arr(vmin)
                 arr_max = self._preclip_native_arr(vmax)
@@ -141,7 +149,7 @@ class GridMet(Processor):
             vmin = vmin.clip(low, high)
             vmax = vmax.clip(low, high)
 
-        data = (xr.apply_ufunc(np.abs, vmax + vmin) / 2)
+        data = ((vmax + vmin) / 2)
         data.name = f_cfg.name
         return data
 
@@ -152,7 +160,7 @@ class GridMet(Processor):
         vmin = vmin.clip(0, 100)
         vmax = vmax.clip(0, 100)
 
-        data = (xr.apply_ufunc(np.abs, vmax + vmin) / 2).astype("float32")
+        data = ((vmax + vmin) / 2).astype("float32")
         data.name = f_cfg.name
         return data
 
@@ -190,8 +198,8 @@ class GridMet(Processor):
         return val.astype("float32")
     
     def _build_dead_fuel_moisture_pct(self, val: xr.DataArray, f_cfg: Feature) -> xr.DataArray:
-        """ In: precipitation (mm)
-            Out: precipitation (mm)
+        """ In: 100-hr dead fuel moisture (%)
+            Out: 100-hr dead fuel moisture (%), clipped
         """
         data = val.clip(0, 100).astype("float32")
         data.name = f_cfg.name
