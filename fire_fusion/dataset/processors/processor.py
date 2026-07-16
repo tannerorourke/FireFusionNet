@@ -17,6 +17,12 @@ class Processor:
         self.mCRS = gridref.rio.crs
         self.transformer = self.gridref.rio.transform()
 
+        # Callable(xr.Dataset) set by the builder. Features that
+        # expand into several large arrays can push each one through the sink
+        # as soon as it is ready (and return an empty Dataset) instead of
+        # holding every part in memory at once.
+        self.sink = None
+
     def build_feature(self, f_config: Feature) -> xr.Dataset:
         """ - Read necessary files based on the feature key,
             - route to corresponding functions to process
