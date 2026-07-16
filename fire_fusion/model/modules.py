@@ -16,14 +16,17 @@ class ConvResidualBlock(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         self.relu = nn.ReLU(inplace=True)
 
-        self.is_downsample = stride != 1 or (in_ch != out_ch)
+        # only projected when the residual and trunk shapes disagree; an
+        # unconditional branch would carry parameters that never see a gradient
         self.downsample = (
             nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(out_ch),
             )
+            if stride != 1 or (in_ch != out_ch)
+            else None
         )
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
         out = self.bn1(self.conv1(x))
@@ -31,7 +34,7 @@ class ConvResidualBlock(nn.Module):
         out = self.bn2(self.conv2(out))
         out = self.dropout(out)
 
-        if self.is_downsample:
+        if self.downsample is not None:
             identity = self.downsample(identity)
 
         out = out + identity
@@ -242,7 +245,8 @@ class TemporalMixingAttention(nn.Module):
         self.attn = nn.MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
-            batch_first=True
+            batch_first=True,
+            dropout=dropout
         )
 
         hidden_dim = int(embed_dim * mlp_ratio)
@@ -259,15 +263,16 @@ class TemporalMixingAttention(nn.Module):
         B, T, C, Hp, Wp = f.shape
 
         # collapse B/H'/W' -- each pixel for each channel across time
-        f_permute = f.permute(0, 3, 4, 1, 2).contiguous() 
+        f_permute = f.permute(0, 3, 4, 1, 2).contiguous()
         x = f_permute.view(B*Hp*Wp, T, C)
 
-        x = self.norm(x)
-        out_attn, _ = self.attn(x, x, x)
+        # pre-norm: each sub-block normalizes its own input and leaves the
+        # residual stream itself untouched, with a LayerNorm per sub-block
+        x_norm = self.norm(x)
+        out_attn, _ = self.attn(x_norm, x_norm, x_norm)
         x = x + out_attn
 
-        x = self.norm(x)
-        out_ffn = self.mlp(x)
+        out_ffn = self.mlp(self.norm2(x))
         x = x + out_ffn
 
         # --> back to (B, T, embed_dim, H', W')
@@ -285,7 +290,7 @@ class BiHeadDecoder(nn.Module):
     Input:  (B, embed_dim, H', W') -- time dimension collapsed to last day
     Output: (B, 1, H, W) and (B, num_classes, H, W) per two heads
     """
-    def __init__(self, embed_dim, out_size, n_cause_classes = 3):
+    def __init__(self, embed_dim, out_size, n_cause_classes: int):
         super().__init__()
         self.out_H, self.out_W = out_size
         self.n_cause_classes = n_cause_classes

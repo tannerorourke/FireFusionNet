@@ -1,18 +1,7 @@
 from typing import Dict, List, Literal, Optional, Tuple
 import torch
 import torch.nn as nn
-import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sb
-from sklearn.metrics import (
-    average_precision_score,
-    confusion_matrix,
-    accuracy_score,
-    jaccard_score,
-    precision_recall_fscore_support,
-    roc_auc_score,
-)
 
 class TemperatureScaler(nn.Module):
     """
@@ -33,7 +22,7 @@ class Metric:
         self.record = []
     def reset(self) -> None:
         raise NotImplementedError
-    def add(self, preds: torch.Tensor, labels: torch.Tensor):
+    def add(self, preds: torch.Tensor, labels: torch.Tensor, mask: Optional[torch.Tensor] = None):
         raise NotImplementedError
     def compute_step(self) -> Dict:
         raise NotImplementedError
@@ -54,14 +43,19 @@ class Accuracy(Metric):
         self.ep_total = 0
 
     @torch.no_grad()
-    def add(self, preds: torch.Tensor, labels: torch.Tensor):
+    def add(self, preds: torch.Tensor, labels: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """ Update accuracy and ground truth labels
         Args:
             preds (torch.LongTensor): (b,) or (b, h, w) tensor with class predictions
             labels (torch.LongTensor): (b,) or (b, h, w) tensor with ground truth class labels
+            mask (torch.BoolTensor): optional (b, h, w) selection of the cells to score
         """
+        if mask is not None:
+            preds = preds[mask]
+            labels = labels[mask]
+
         self.ep_correct += (preds.type_as(labels) == labels).sum().item()
-        self.ep_total += labels.numel()   
+        self.ep_total += labels.numel()
 
     def compute_step(self) -> dict[str, float]:
         """ Return scores for the epoch, reset internal state, and update p/epoch record """
@@ -84,7 +78,11 @@ class Accuracy(Metric):
 class ConfusionMatrix(Metric):
     """
     Metric for computing mean IoU, accuracy, precision, recall, F1, and confusion matrix.
-    Uses sklearn under the hood.
+
+    Counts accumulate into the matrix itself, so memory is O(num_classes^2)
+    rather than O(cells seen): an epoch of per-pixel predictions is billions of
+    entries at the finer grid resolutions. Every score below is a function of
+    the matrix alone.
     """
 
     def __init__(self, num_classes: int = 3):
@@ -95,42 +93,40 @@ class ConfusionMatrix(Metric):
         super().__init__()
         self.num_classes = num_classes
         self.record: List[Dict] = []
-        self.y_true: List[np.ndarray] = []
-        self.y_pred: List[np.ndarray] = []
+        self.matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
 
     def reset(self):
-        self.y_true = []
-        self.y_pred = []
+        self.matrix = np.zeros((self.num_classes, self.num_classes), dtype=np.int64)
 
     @torch.no_grad()
-    def add(self, preds: torch.Tensor, labels: torch.Tensor):
+    def add(self, preds: torch.Tensor, labels: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """
-        Update using predictions and ground truth labels.
+        Update using predicted and ground truth class indices.
 
         Args:
-            preds:  logits or class indices
-                    - (B, C, ...)  -> argmax over C
-                    - (B, ...)     -> treated as class indices
-            labels: (B, ...) with ground truth class indices
+            preds:  (B, ...) class indices (see MetricsManager._logits_to_preds)
+            labels: (B, ...) ground truth class indices
+            mask:   optional (B, ...) selection of the cells to score
         """
-        # Keep labels as a Tensor, derive a NumPy view
-        labels_flat = labels.view(-1)
-        labels_np = labels_flat.cpu().numpy().astype(int)
+        if mask is not None:
+            preds = preds[mask]
+            labels = labels[mask]
 
-        # Convert logits -> predicted classes
-        if preds.dim() > 1:
-            # Multi-class logits: (B, C, ...)
-            if preds.size(1) == self.num_classes:
-                preds = torch.argmax(preds, dim=1)
-            # Binary logits with single channel: (B, 1, ...)
-            elif preds.size(1) == 1 and self.num_classes == 2:
-                preds = (preds.squeeze(1) > 0).long()
+        preds_np = preds.detach().cpu().numpy().astype(np.int64).ravel()
+        labels_np = labels.detach().cpu().numpy().astype(np.int64).ravel()
 
-        preds_flat = preds.view(-1)
-        preds_np = preds_flat.cpu().numpy().astype(int)
+        # cells carrying no class (cause is -1 wherever no ignition is labeled)
+        # sit outside the matrix and are not scored
+        keep = (
+            (labels_np >= 0) & (labels_np < self.num_classes)
+            & (preds_np >= 0) & (preds_np < self.num_classes)
+        )
+        if not keep.any():
+            return
 
-        self.y_true.append(labels_np)
-        self.y_pred.append(preds_np)
+        flat = labels_np[keep] * self.num_classes + preds_np[keep]
+        counts = np.bincount(flat, minlength=self.num_classes ** 2)
+        self.matrix += counts.reshape(self.num_classes, self.num_classes)
 
     def compute_step(
         self,
@@ -143,8 +139,11 @@ class ConfusionMatrix(Metric):
         roc_auc / pr_auc:
             Optional AUC scores for this epoch (computed elsewhere from raw logits).
         """
-        if not self.y_true:
-            self.record.append({
+        cm = self.matrix
+        total = float(cm.sum())
+
+        if total == 0:
+            scores = {
                 "mean_iou": 0.0,
                 "accuracy": 0.0,
                 "precision": 0.0,
@@ -152,56 +151,40 @@ class ConfusionMatrix(Metric):
                 "f1": 0.0,
                 "roc_auc": roc_auc,
                 "pr_auc": pr_auc,
-                "matrix": np.zeros((self.num_classes, self.num_classes), dtype=int),
-            })
-            return {"iou": 0.0, "accuracy": 0.0}
+            }
+            self.record.append({**scores, "matrix": cm.copy()})
+            self.reset()
+            return scores
 
-        y_true = np.concatenate(self.y_true)
-        y_pred = np.concatenate(self.y_pred)
-        labels = np.arange(self.num_classes)
+        # rows are ground truth, columns are predictions
+        tp = np.diag(cm).astype(np.float64)
+        fp = cm.sum(axis=0).astype(np.float64) - tp
+        fn = cm.sum(axis=1).astype(np.float64) - tp
 
-        # Confusion matrix
-        cm = confusion_matrix(y_true, y_pred, labels=labels)
+        def _ratio(num: np.ndarray, den: np.ndarray) -> np.ndarray:
+            # a class absent from both truth and predictions scores 0, not NaN
+            return np.divide(num, den, out=np.zeros_like(num), where=den > 0)
 
-        # Accuracy
-        accuracy = accuracy_score(y_true, y_pred)
+        iou = _ratio(tp, tp + fp + fn)
+        precision = _ratio(tp, tp + fp)
+        recall = _ratio(tp, tp + fn)
+        f1 = _ratio(2.0 * precision * recall, precision + recall)
 
-        # IoU (Jaccard) per class + macro mean
-        iou_per_class = jaccard_score(
-            y_true, y_pred,
-            labels=labels,
-            average=None,
-            zero_division=0,
-        )
-        mean_iou = float(iou_per_class)
-
-        # Precision / Recall / F1 (macro)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            y_true,
-            y_pred,
-            labels=labels,
-            average="macro",
-            zero_division=0,
-        )
-
-        self.record.append({
-            "mean_iou": mean_iou,
-            "accuracy": float(accuracy),
-            "precision": float(precision),
-            "recall": float(recall),
-            "f1": float(f1),
+        scores = {
+            "mean_iou": float(iou.mean()),
+            "accuracy": float(tp.sum() / total),
+            "precision": float(precision.mean()),
+            "recall": float(recall.mean()),
+            "f1": float(f1.mean()),
             "roc_auc": roc_auc,
             "pr_auc": pr_auc,
-            "matrix": cm,
-        })
+        }
 
+        self.record.append({**scores, "matrix": cm.copy()})
         self.reset()
 
-        return {
-            "iou": mean_iou,
-            "accuracy": float(accuracy),
-        }
-    
+        return scores
+
     def get_history(self) -> Tuple[np.ndarray | None, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], List[Dict]]:
         """
         Returns:
@@ -243,9 +226,94 @@ class ConfusionMatrix(Metric):
             np.asarray(fnr_list, dtype=float),
         )
         return last_cm, rates, self.record
-    
 
 
+
+
+class BinaryAUC(Metric):
+    """
+    ROC-AUC and PR-AUC for a single-logit head, accumulated as per-class
+    histograms of the score.
+
+    Threshold-free ranking scores are the only ones that separate a useful
+    ignition model from one that answers "no fire" everywhere, since accuracy
+    reads ~1.0 at the class ratio this dataset carries. Bucketing scores holds
+    memory at O(num_bins) instead of an epoch of per-pixel logits.
+    """
+
+    def __init__(self, num_bins: int = 4096, logit_range: Tuple[float, float] = (-16.0, 16.0)):
+        super().__init__()
+        self.num_bins = num_bins
+        self.lo, self.hi = logit_range
+        self.pos = np.zeros(num_bins, dtype=np.int64)
+        self.neg = np.zeros(num_bins, dtype=np.int64)
+
+    def reset(self) -> None:
+        self.pos[:] = 0
+        self.neg[:] = 0
+
+    @torch.no_grad()
+    def add(self, logits: torch.Tensor, labels: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        """
+        Args:
+            logits: (B, 1, H, W) or (B, H, W) raw scores for the positive class
+            labels: (B, H, W) ground truth in {0, 1}
+            mask:   optional (B, H, W) selection of the cells to score
+        """
+        if logits.dim() == 4 and logits.size(1) == 1:
+            logits = logits.squeeze(1)
+
+        if mask is not None:
+            logits = logits[mask]
+            labels = labels[mask]
+        if labels.numel() == 0:
+            return
+
+        # scores outside the range already rank above/below every in-range
+        # score, so clamping preserves the ordering the AUCs depend on
+        scores = logits.detach().float().flatten().clamp(self.lo, self.hi)
+        width = (self.hi - self.lo) / self.num_bins
+        bins = ((scores - self.lo) / width).long().clamp(0, self.num_bins - 1)
+
+        bins_np = bins.cpu().numpy()
+        labels_np = labels.detach().flatten().cpu().numpy()
+
+        self.pos += np.bincount(bins_np[labels_np == 1], minlength=self.num_bins)
+        self.neg += np.bincount(bins_np[labels_np != 1], minlength=self.num_bins)
+
+    def compute_step(self) -> Dict[str, float]:
+        n_pos, n_neg = int(self.pos.sum()), int(self.neg.sum())
+
+        if n_pos == 0 or n_neg == 0:
+            scores = {"roc_auc": float("nan"), "pr_auc": float("nan")}
+            self.record.append(scores)
+            self.reset()
+            return scores
+
+        # sweep the decision threshold from the highest-scoring bucket downward
+        tp = np.cumsum(self.pos[::-1]).astype(np.float64)
+        fp = np.cumsum(self.neg[::-1]).astype(np.float64)
+
+        recall = tp / n_pos
+        precision = tp / np.maximum(tp + fp, 1.0)
+        fpr = fp / n_neg
+
+        # trapezoid over the ROC curve, anchored at the origin
+        r = np.concatenate([[0.0], recall])
+        f = np.concatenate([[0.0], fpr])
+        roc_auc = float(np.sum(np.diff(f) * (r[1:] + r[:-1]) / 2.0))
+
+        # average precision: each threshold's precision weighted by the recall it adds
+        pr_auc = float(np.sum(np.diff(r) * precision))
+
+        scores = {"roc_auc": roc_auc, "pr_auc": pr_auc}
+        self.record.append(scores)
+        self.reset()
+
+        return scores
+
+    def get_history(self) -> List[Dict]:
+        return self.record
 
 
 
@@ -255,19 +323,20 @@ class MetricsManager:
         num_classes: Tuple with number of classes per prediction head
             e.g. one binary classifier + separate 4-class head -> (2, 4)
         """
+        assert num_classes and num_classes[0] == 2, \
+            "head 0 is the binary ignition head; its ranking scores assume a single logit"
+
         self.num_classes = num_classes
         self.num_heads = len(num_classes)
-
-        self.trn_logits: List[List[torch.Tensor]] = []
-        self.val_logits: List[List[torch.Tensor]] = []
-        self.trn_labels: List[List[torch.Tensor]] = []
-        self.val_labels: List[List[torch.Tensor]] = []
 
         self.trn_accuracies = [Accuracy() for _ in range(self.num_heads)]
         self.val_accuracies = [Accuracy() for _ in range(self.num_heads)]
 
         # One confusion matrix per head, with correct class count
         self.val_cm = [ConfusionMatrix(nc) for nc in self.num_classes]
+
+        # Ranking scores for the binary ignition head
+        self.val_auc = BinaryAUC()
 
         # Loss history: (num_loss_terms, num_epochs)
         self.trn_losses: Optional[np.ndarray] = None
@@ -284,56 +353,67 @@ class MetricsManager:
     @staticmethod
     def _logits_to_preds(logits: torch.Tensor, n_classes: int) -> torch.Tensor:
         """
-        Convert logits tensor to class index tensor.
+        Convert a head's logits to class indices.
         Handles:
-          - binary (single-channel logits) -> threshold at 0
-          - multi-class logits -> argmax
-          - already-indexed tensors (fallback)
-        """
-        if logits.dim() == 1:
-            return logits.long()
+          - multi-class logits (B, C, ...) -> argmax over C
+          - binary logits (B, 1, ...)      -> threshold at 0
 
-        # Multi-class logits: (B, C, ...)
-        if logits.size(1) == n_classes and n_classes > 1:
+        A head whose channel count contradicts its class count is a wiring
+        error, and silently reading logits as indices hides it until the
+        shapes collide somewhere less obvious.
+        """
+        if logits.dim() > 1 and logits.size(1) == n_classes and n_classes > 1:
             return torch.argmax(logits, dim=1)
 
-        # Binary logits with single channel: (B, 1, ...)
-        if logits.size(1) == 1 and n_classes == 2:
+        if logits.dim() > 1 and logits.size(1) == 1 and n_classes == 2:
             return (logits.squeeze(1) > 0).long()
 
-        # Fallback: assume already indices
-        return logits.long()
+        raise ValueError(
+            f"logits {tuple(logits.shape)} do not describe {n_classes} classes; "
+            f"expected (B, {n_classes}, ...), or (B, 1, ...) for a binary head"
+        )
+
+    @staticmethod
+    def _last_day(labels: torch.Tensor) -> torch.Tensor:
+        """ Loaders emit (B, H, W) for the window's final day; tolerate (B, T, H, W). """
+        return labels[:, -1] if labels.dim() == 4 else labels
 
     def add(
         self,
         type: Literal["train", "eval"],
         logits: List[torch.Tensor],
         golds: List[torch.Tensor],
+        masks: Optional[List[torch.Tensor]] = None,
     ):
+        """
+        One entry per output head. Each mask selects the cells that head is
+        supervised on, so the scores describe the same population as the loss;
+        unmasked scores over every cell are dominated by ocean and by the
+        no-ignition class.
+        """
         assert len(logits) == self.num_heads, f"send one logit tensor for each ({self.num_heads}) output head"
         assert len(golds) == self.num_heads, f"send one golds tensor for each ({self.num_heads}) output head"
+        assert masks is None or len(masks) == self.num_heads, \
+            f"send one mask tensor for each ({self.num_heads}) output head"
 
-        if type == "train":
-            self.trn_logits.append(logits)
-            self.trn_labels.append(golds)
-            for i, acc in enumerate(self.trn_accuracies):
-                preds_i = self._logits_to_preds(logits[i], self.num_classes[i])
-                labels_i = golds[i].long()
-                acc.add(preds_i, labels_i[:, -1])
+        def mask_for(head: int) -> Optional[torch.Tensor]:
+            return masks[head] if masks is not None else None
 
-        elif type == "eval":
-            self.val_logits.append(logits)
-            self.val_labels.append(golds)
+        accuracies = self.trn_accuracies if type == "train" else self.val_accuracies
+        for i, acc in enumerate(accuracies):
+            preds_i = self._logits_to_preds(logits[i], self.num_classes[i])
+            labels_i = self._last_day(golds[i]).long()
+            acc.add(preds_i, labels_i, mask_for(i))
 
-            for i, acc in enumerate(self.val_accuracies):
-                preds_i = self._logits_to_preds(logits[i], self.num_classes[i])
-                labels_i = golds[i].long()
-                acc.add(preds_i, labels_i[:, -1])
+        if type != "eval":
+            return
 
-            for i, cm in enumerate(self.val_cm):
-                preds_i = self._logits_to_preds(logits[i], self.num_classes[i])
-                labels_i = golds[i].long()
-                cm.add(preds_i, labels_i[: -1])
+        for i, cm in enumerate(self.val_cm):
+            preds_i = self._logits_to_preds(logits[i], self.num_classes[i])
+            labels_i = self._last_day(golds[i]).long()
+            cm.add(preds_i, labels_i, mask_for(i))
+
+        self.val_auc.add(logits[0], self._last_day(golds[0]).long(), mask_for(0))
 
     def add_epoch_totals(
         self,
@@ -357,57 +437,6 @@ class MetricsManager:
             else:
                 self.val_losses = np.concatenate([self.val_losses, new_col], axis=1)
 
-    def compute_val_auc(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute ROC-AUC and PR-AUC per head across the full validation epoch.
-
-        Uses stored self.val_logits and self.val_labels.
-        Returns:
-            roc_aucs: (num_heads,)
-            pr_aucs:  (num_heads,)
-        NOTE: This assumes you reshape logits/labels appropriately before calling sklearn.
-              Currently not used in training loop; safe to leave as-is or extend later.
-        """
-        roc_aucs: List[float] = []
-        pr_aucs: List[float] = []
-
-        for head_idx, n_classes in enumerate(self.num_classes):
-            if not self.val_logits:
-                roc_aucs.append(float("nan"))
-                pr_aucs.append(float("nan"))
-                continue
-
-            logits_head = torch.cat([b[head_idx] for b in self.val_logits], dim=0)
-            labels_head = torch.cat([b[head_idx] for b in self.val_labels], dim=0)
-
-            # Flatten spatial dimensions if present
-            if logits_head.dim() > 2:
-                # (B, C, H, W) -> (B*H*W, C)
-                c = logits_head.size(1)
-                logits_head = logits_head.permute(0, 2, 3, 1).reshape(-1, c)
-                labels_head = labels_head.view(-1)
-
-            probs = torch.softmax(logits_head, dim=1).cpu().numpy()
-            y = labels_head.cpu().numpy().astype(int)
-
-            if n_classes == 2:
-                scores = probs[:, 1]
-                roc = roc_auc_score(y, scores)
-                pr = average_precision_score(y, scores)
-            else:
-                y_one_hot = np.eye(n_classes)[y]
-                roc = roc_auc_score(
-                    y_one_hot, probs, multi_class="ovr", average="macro"
-                )
-                pr = average_precision_score(
-                    y_one_hot, probs, average="macro"
-                )
-
-            roc_aucs.append(float(roc))
-            pr_aucs.append(float(pr))
-
-        return np.asarray(roc_aucs), np.asarray(pr_aucs)
-
     def epoch_forward(self):
         """
         Print losses for this epoch, update best score, and increment epoch counter.
@@ -422,8 +451,10 @@ class MetricsManager:
         for acc in self.val_accuracies:
             acc.compute_step()
 
-        # Finalize confusion matrices for this epoch (fills .record in ConfusionMatrix)
-        for cm in self.val_cm:
+        # Finalize confusion matrices for this epoch (fills .record in ConfusionMatrix).
+        # The ignition head carries the epoch's ranking scores alongside its matrix.
+        ign_scores = self.val_cm[0].compute_step(**self.val_auc.compute_step())
+        for cm in self.val_cm[1:]:
             cm.compute_step()
 
         trn_last = self.trn_losses[:, -1]
@@ -441,6 +472,11 @@ class MetricsManager:
             f"Eval   >> mL (total): {val_total:.4f}, "
             f"mL (ign): {val_ign:.4f}, "
             f"mL (cause): {val_cause:.3f}\n"
+            f"Ignition (supervised cells) >> "
+            f"PR-AUC: {ign_scores['pr_auc']:.5f}, "
+            f"ROC-AUC: {ign_scores['roc_auc']:.4f}, "
+            f"F1: {ign_scores['f1']:.4f}, "
+            f"recall: {ign_scores['recall']:.4f}\n"
             f"         SCORE: {score:.4f}"
         )
 
@@ -455,12 +491,6 @@ class MetricsManager:
             self.no_improve = 0
         else:
             self.no_improve += 1
-
-        # Clear stored logits/labels so we don't accumulate across epochs
-        self.trn_logits.clear()
-        self.trn_labels.clear()
-        self.val_logits.clear()
-        self.val_labels.clear()
 
         self.epoch += 1
         return score, new_best, trn_last, val_last

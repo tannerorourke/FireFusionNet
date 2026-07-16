@@ -35,6 +35,11 @@ class WRMTrainer:
         self.use_amp = bool(device.type == "cuda")
         self.debug = debug
 
+        # fp16 gradients underflow well before the ignition loss does (pos_weight
+        # is O(1e4)); the scaler keeps them representable and drops any step that
+        # still overflows
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+
         self.train_loader = init_data_loader(
             "train", dataset_name, num_workers, training_params["batch_size"]
         )
@@ -42,15 +47,18 @@ class WRMTrainer:
             "eval", dataset_name, num_workers, training_params["batch_size"]
         )
 
-        # channel count, output size, and class balance come from the built
-        # dataset's manifest, not from hardcoded params
+        # channel count, output size, cause classes, and class balance come from
+        # the built dataset's manifest, not from hardcoded params
         train_set = self.train_loader.dataset
         model_params = dict(model_params)
         model_params["out_size"] = list(train_set.out_size)
+        model_params["n_cause_classes"] = train_set.n_cause_classes
         in_channels = train_set.in_channels
         ign_pos_weight = train_set.ign_pos_weight
         print(f"[WRMTrainer] dataset={dataset_name} in_channels={in_channels} "
-              f"out_size={model_params['out_size']} pos_weight={ign_pos_weight:.2f}")
+              f"out_size={model_params['out_size']} "
+              f"cause_classes={model_params['n_cause_classes']} "
+              f"pos_weight={ign_pos_weight:.2f}")
 
         self.model = FireFusionModel(in_channels, mp=model_params).to(self.device)
 
@@ -66,38 +74,46 @@ class WRMTrainer:
             [float(ign_pos_weight)], dtype=torch.float32, device=device
         )
         self.bcewl_loss = nn.BCEWithLogitsLoss(reduction="none", pos_weight=self.ign_pos_weight)
-        self.mm = MetricsManager(num_classes=(2, 3))
+        self.mm = MetricsManager(num_classes=(2, train_set.n_cause_classes))
 
         if mode == "train": self.train()
         else: self.test()
 
+    @staticmethod
+    def _last_day(t: torch.Tensor) -> torch.Tensor:
+        """ Loaders emit (B, H, W) for the window's final day; tolerate (B, T, H, W). """
+        return t[:, -1] if t.ndim == 4 else t
+
+    def _prepare_targets(self, golds: Dict, masks: Dict):
+        """ Collapse any window-time dimension and build the per-head masks of
+            supervised cells. Loss and metrics both read these, so the reported
+            scores describe the population the model was actually trained on.
+        """
+        ign_golds = self._last_day(golds["ign_next"])
+        cause_golds = self._last_day(golds["ign_next_cause"])
+        act_fire_mask = self._last_day(masks["act_fire_mask"])
+        water_mask = self._last_day(masks["water_mask"])
+
+        # equals 1 if land (water_mask: 1 = water) and not burning at time T
+        ign_mask = (water_mask == 0) & (act_fire_mask == 1)
+
+        # cause is only defined where an ignition at t+1 carries a known cause
+        cause_mask = (ign_golds == 1) & (cause_golds != -1) & ign_mask
+
+        return ign_golds, cause_golds, ign_mask, cause_mask
+
     def _compute_loss(self,
-        ign_logits: torch.Tensor, ign_golds: torch.Tensor,  # both (B, 1, H, W)
+        ign_logits: torch.Tensor, ign_golds: torch.Tensor,  # (B, 1, H, W), (B, H, W)
         cause_logits: torch.Tensor,                         # (B, num_classes, H, W)
         cause_golds: torch.Tensor,                          # (B, H, W)
-        act_fire_mask: torch.Tensor,
-        water_mask: torch.Tensor,
+        ign_mask: torch.Tensor,                             # (B, H, W)
+        cause_mask: torch.Tensor,                           # (B, H, W)
         alpha_ign: float = 1.0,
         alpha_cause: float = 1.0
     ):
         """ Compute BCELogitsLoss on ignition at time t + 1,
             as well as cross entropy loss on ignition TYPE given an ignition
         """
-        # === Collapse TIME DIMENSION to final step T + 1
-        # (loaders emitting per-window labels already deliver (B, H, W))
-        if ign_golds.ndim == 4:          # (B, T, H, W)
-            ign_golds = ign_golds[:, -1] # (B, H, W)
-        if cause_golds.ndim == 4:
-            cause_golds = cause_golds[:, -1]  # (B, H, W), assuming this layout
-
-        if act_fire_mask.ndim == 4:
-            act_fire_mask = act_fire_mask[:, -1]  # (B, H, W)
-        if water_mask.ndim == 4:
-            water_mask = water_mask[:, -1]       # (B, H, W)
-
-        # equals 1 if land (water_mask: 1 = water) and not burning at time T
-        ign_mask = (water_mask == 0) & (act_fire_mask == 1)
-
         # === Ignition Loss: on ignition at t = t+1 ===============
         ign_logits_flat = ign_logits.squeeze(1)
         ign_targets = ign_golds.float()
@@ -113,8 +129,6 @@ class WRMTrainer:
         )
 
         # === Cause loss: =========================================
-        # Only compute ignition (1) at t+1, (2) valid cause label and (3) passes water mask
-        cause_mask = (ign_golds == 1) & (cause_golds != -1) & ign_mask
         if cause_mask.any():
             cause_logits_flat = cause_logits.permute(0, 2, 3, 1)[cause_mask]
             cause_targets_flat = cause_golds[cause_mask].long()
@@ -169,14 +183,14 @@ class WRMTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             # lr_used = self.optimizer.param_groups[0]["lr"]
 
+            ign_golds, cause_golds, ign_mask, cause_mask = self._prepare_targets(golds, masks)
+
             with autocast(device_type=self.device.type, enabled=self.use_amp):
                 ign_logits, cause_logits = self.model(X)         # (B, 1, H, W), (B, num_classes, H, W)
-                ign_golds = golds["ign_next"]
-                cause_golds = golds["ign_next_cause"]
 
                 tot_loss, ign_loss, cause_loss = self._compute_loss(
                     ign_logits, ign_golds, cause_logits, cause_golds,
-                    masks["act_fire_mask"], masks["water_mask"]
+                    ign_mask, cause_mask
                 )
 
             # Log total loss
@@ -184,15 +198,18 @@ class WRMTrainer:
             ep_ign_loss += ign_loss.item()
             ep_cause_loss += cause_loss.item()
             n_samples += golds["ign_next"].size(0)
-            self.mm.add('train', 
+            self.mm.add('train',
                 logits=[ign_logits.detach().cpu(), cause_logits.detach().cpu()],
-                golds =[ign_golds.detach().cpu(), cause_golds.detach().cpu()]
+                golds =[ign_golds.detach().cpu(), cause_golds.detach().cpu()],
+                masks =[ign_mask.detach().cpu(), cause_mask.detach().cpu()]
             )
 
-            # Backpropogate -> clip gradients -> step optimizer -> step optimizer
-            tot_loss.backward()
+            # Backpropogate -> unscale for clipping -> clip gradients -> step optimizer
+            self.scaler.scale(tot_loss).backward()
+            self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             self.scheduler.step()
 
         self.mm.add_epoch_totals("train", 
@@ -211,14 +228,14 @@ class WRMTrainer:
                 golds = { k: v.to(self.device) for k, v in golds.items() }
                 masks = { k: v.to(self.device) for k, v in masks.items() }
                 
+                ign_golds, cause_golds, ign_mask, cause_mask = self._prepare_targets(golds, masks)
+
                 with autocast(device_type=self.device.type, enabled=self.use_amp):
                     ign_logits, cause_logits = self.model(features)
-                    ign_golds = golds["ign_next"]
-                    cause_golds = golds["ign_next_cause"]
 
                     tot_loss, ign_loss, cause_loss = self._compute_loss(
                         ign_logits, ign_golds, cause_logits, cause_golds,
-                        masks["act_fire_mask"], masks["water_mask"]
+                        ign_mask, cause_mask
                     )
 
                 # Log total loss for epoch
@@ -227,16 +244,17 @@ class WRMTrainer:
                 ep_cause_loss += cause_loss.item()
                 n_samples += golds["ign_next"].size(0)
 
-                self.mm.add('eval', 
+                self.mm.add('eval',
                     logits=[ign_logits.detach().cpu(), cause_logits.detach().cpu()],
-                    golds =[ign_golds.detach().cpu(), cause_golds.detach().cpu()]
+                    golds =[ign_golds.detach().cpu(), cause_golds.detach().cpu()],
+                    masks =[ign_mask.detach().cpu(), cause_mask.detach().cpu()]
                 )
 
         self.mm.add_epoch_totals("eval", 
             np.array([ep_total_loss, ep_ign_loss, ep_cause_loss])
         )
 
-    def train(self, acc_goal = 0.7):
+    def train(self):
         self.optimizer = optim.AdamW(
             self.model.parameters(), 
             lr=self.base_lr, 
@@ -262,24 +280,24 @@ class WRMTrainer:
             self.eval_epoch()
 
             score, new_best, trn_last, val_last = self.mm.epoch_forward()
-            save_best = False
             epochs_ran += 1
+
+            # kept under a fixed name so the best weights survive the epochs that follow
+            if new_best:
+                best_path = save_model(self.model, name_base="wf_risk_model_best", overwrite=True)
+                print(f"Saved best weights >> {best_path}\n")
 
             if self.mm.no_improve > self.ep_early_stop:
                 print(f"Stopped training for early stop")
                 break
-                
-            if save_best:
-                print(f"You beat the goal!! Saving model\n")
-                save_model(self.model)
-
 
         elapsed_min = (perf_counter() - time0) // 60
         elapsed_sec = (perf_counter() - time0) % 60
         print(f"Finished training in {elapsed_min:.0f} min {elapsed_sec:.0f} sec")
         print(f"Best score @epoch {self.mm.best['epoch']} >> score: {self.mm.best['score']:.5f}")
 
-        save_model(self.model)
+        final_path = save_model(self.model)
+        print(f"Saved final weights >> {final_path}")
 
         # Do some plotting and fun visualizations!
         

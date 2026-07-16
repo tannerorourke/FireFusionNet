@@ -46,6 +46,7 @@ class FireDataset(Dataset):
             int(self.manifest["grid"]["height"]),
             int(self.manifest["grid"]["width"]),
         )
+        self.n_cause_classes = int(self.manifest["n_cause_classes"])
         self.ign_pos_weight = float(self.manifest["ign_pos_weight"])
 
         if self.X.sizes["channel"] != self.in_channels:

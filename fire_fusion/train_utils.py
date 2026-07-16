@@ -40,16 +40,26 @@ def get_device_config(maximum: int | None = None, utilization: float | None = 0.
     return device, workers
 
 
-def save_model(model: torch.nn.Module) -> str:
-    """ Use this function to save your model in train.py """
+def save_model(
+    model: torch.nn.Module,
+    name_base: str = "wf_risk_model",
+    overwrite: bool = False,
+) -> str:
+    """ Use this function to save your model in train.py
+
+    overwrite: write to `<name_base>.th` instead of taking the next free
+    `<name_base>_<i>.th`, for checkpoints that are re-saved as a run improves.
+    """
     MODEL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-    name_base = "wf_risk_model"
-    i = 1
-    while (Path(MODEL_SAVE_DIR / f"{name_base}_{i}.th").exists()):
-        i += 1
+    if overwrite:
+        output_path = MODEL_SAVE_DIR / f"{name_base}.th"
+    else:
+        i = 1
+        while (Path(MODEL_SAVE_DIR / f"{name_base}_{i}.th").exists()):
+            i += 1
+        output_path = MODEL_SAVE_DIR / f"{name_base}_{i}.th"
 
-    output_path = MODEL_SAVE_DIR / f"{name_base}_{i}.th"
     torch.save(model.state_dict(), output_path)
 
     return str(output_path)
@@ -70,7 +80,12 @@ class WarmupCosineAnnealingLR:
 
         w_steps = max(0, warmup_steps)
         base_lr = float(optimizer.param_groups[0]["lr"])
-        start_factor = min_lr / base_lr
+
+        # LinearLR scales base_lr by start_factor and requires it in (0, 1]. A
+        # base_lr of 0 (the null-learning profile) leaves the ratio undefined,
+        # and any factor of zero is still zero, so warm up at full scale.
+        start_factor = min_lr / base_lr if base_lr > 0 else 1.0
+        start_factor = float(min(1.0, max(start_factor, 1e-8)))
 
         warmup = optim.lr_scheduler.LinearLR(
             optimizer,

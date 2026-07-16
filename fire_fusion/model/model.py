@@ -41,12 +41,13 @@ class FireFusionModel(nn.Module):
         tm_dropout  =tm_params['dropout']
 
         out_size    =mp['out_size'];
+        n_causes    =mp['n_cause_classes']
 
         self.encoder = SpatialEncoder(in_channels, embed_dim)
         self.ws_attn = WindowedSpatialAttention(embed_dim, num_heads=ws_heads, window_size=ws_win_size, dropout=ws_dropout)
         self.cm_attn = ChannelMixingAttention(num_heads=cm_heads, num_channels=embed_dim, d_model=cm_d_model, mlp_ratio=cm_mlp_ratio, dropout=cm_dropout)
         self.tm_attn = TemporalMixingAttention(embed_dim, num_heads=tm_heads, mlp_ratio=tm_mlp_ratio, dropout=tm_dropout)
-        self.decoder = BiHeadDecoder(embed_dim, out_size, n_cause_classes=4)
+        self.decoder = BiHeadDecoder(embed_dim, out_size, n_cause_classes=n_causes)
 
     def forward(self, x: torch.Tensor):
         y = self.encoder(x)

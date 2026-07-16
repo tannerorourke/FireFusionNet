@@ -196,30 +196,11 @@ class UsfsFire(Processor):
         )
 
         print(f"sigma pixels = {kde_radius} / {pixel_size_km} = {sigma_pixels}")
-<<<<<<< HEAD
-        
-=======
 
->>>>>>> streaming-build
         # Loop over burn causes, computing gaussian filter for each class.
         # Each timestep's map only accumulates fires observed up to that day:
         # smoothing is linear, so smoothing daily occurrences and cumsum-ing over
         # time is identical to smoothing the running cumulative map at every day
-<<<<<<< HEAD
-        kde_by_class = {}
-        for cause in fire_occurences.coords["burn_cause"].values:
-            occ_txy = fire_occurences.sel(burn_cause=cause).values.astype("float32")
-
-            if occ_txy.sum() == 0:
-                print(f"WARNING: Sum of All X/Y across time is 0 for {cause}")
-                kde_txy = occ_txy
-            else:
-                smoothed = np.zeros_like(occ_txy)
-                fire_days = np.flatnonzero(occ_txy.reshape(occ_txy.shape[0], -1).sum(axis=1) > 0)
-                for t in fire_days:
-                    smoothed[t] = gaussian_filter(occ_txy[t], sigma=sigma_pixels, mode="constant")
-                kde_txy = np.cumsum(smoothed, axis=0, dtype="float32")
-=======
         for cause in fire_occurences.coords["burn_cause"].values:
             # uint8 view of the occurrence stack; only fire days are cast/smoothed
             occ_txy = fire_occurences.sel(burn_cause=cause).values
@@ -233,7 +214,6 @@ class UsfsFire(Processor):
                     occ_txy[t].astype("float32"), sigma=sigma_pixels, mode="constant"
                 )
             np.cumsum(kde_txy, axis=0, out=kde_txy)
->>>>>>> streaming-build
 
             name = f"kde_{str(cause).lower()}"
             da_kde = xr.DataArray(
@@ -244,20 +224,9 @@ class UsfsFire(Processor):
                     "x": fire_occurences.coords["x"],
                 },
                 dims=("time", "y", "x"),
-<<<<<<< HEAD
-                name=f"kde_{str(cause).lower()}"
-            )
-            kde_by_class[f"kde_{str(cause).lower()}"] = da_kde
-
-        kde_ds = xr.Dataset(kde_by_class)
-        kde_ds = kde_ds.rio.write_crs(self.gridref.rio.crs)
-        kde_ds = kde_ds.rio.write_transform(self.gridref.rio.transform())
-        return kde_ds
-=======
                 name=name,
             )
             yield name, da_kde
->>>>>>> streaming-build
 
 
     def _build_perim_layer(self, fp: Path, f_cfg: Feature) -> xr.DataArray:

@@ -37,13 +37,25 @@ def plot_class_accuracy(
         plt.show()
 
 
-def plot_loss_curves(epochs: List, trn_losses, val_losses, save: bool = True):
-    trn_losses = np.asarray(trn_losses)
-    val_losses = np.asarray(val_losses)
+def plot_loss_curves(
+    epochs: List,
+    trn_losses,
+    val_losses,
+    term_names: Tuple[str, ...] = ("total", "ignition", "cause"),
+    save: bool = True,
+):
+    # histories arrive as (num_loss_terms, num_epochs); one line per term
+    trn_losses = np.atleast_2d(np.asarray(trn_losses, dtype=float))
+    val_losses = np.atleast_2d(np.asarray(val_losses, dtype=float))
+
+    def term_label(i: int) -> str:
+        return term_names[i] if i < len(term_names) else f"term {i}"
 
     plt.figure()
-    plt.plot(epochs, trn_losses, label="Train loss")
-    plt.plot(epochs, val_losses, label="Val loss")
+    for i, curve in enumerate(trn_losses):
+        plt.plot(epochs, curve, label=f"Train loss ({term_label(i)})")
+    for i, curve in enumerate(val_losses):
+        plt.plot(epochs, curve, linestyle="--", label=f"Val loss ({term_label(i)})")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Loss per epoch")

@@ -20,12 +20,12 @@ def extract_features_and_labels_from_batch(batch):
     Parameters
     ----------
     batch : tuple
-        Expected format from FireDataset.collate_batch:
+        Expected format from FireDataset:
         (X, label_tensors, mask_tensors)
         where:
             X              : (B, T, C, H, W)
-            label_tensors  : dict[str, Tensor] each (B, T, H, W)
-            mask_tensors   : dict[str, Tensor] each (B, T, H, W)
+            label_tensors  : dict[str, Tensor] each (B, H, W) at the window's final day
+            mask_tensors   : dict[str, Tensor] each (B, H, W) at the window's final day
 
     Returns
     -------
@@ -33,7 +33,7 @@ def extract_features_and_labels_from_batch(batch):
         Shape (B, F) where F = T * C * H * W.
     y_window : np.ndarray
         Shape (B,), binary label for each window:
-        1 if ANY cell/time in that window is positive in the first label tensor, else 0.
+        1 if ANY cell is positive in the first label tensor, else 0.
     """
     X, label_tensors, mask_tensors = batch
 
@@ -52,11 +52,11 @@ def extract_features_and_labels_from_batch(batch):
     #     raise ValueError("label_tensors is empty; need at least one label for classification.")
 
     first_label_tensor = next(iter(label_tensors.values()))
-    label_np = first_label_tensor.detach().cpu().numpy()  # shape (B, T, H, W)
+    label_np = first_label_tensor.detach().cpu().numpy()  # shape (B, H, W)
 
-    # Window-level binary label: 1 if ANY cell/time is positive, else 0
-    # Axis order: (B, T, H, W) -> reduce across (T, H, W) for each B
-    y_window = (label_np > 0).any(axis=(1, 2, 3)).astype(np.int64)  # shape (B,)
+    # Window-level binary label: 1 if ANY cell is positive, else 0.
+    # Reduce every dimension but the batch, whatever the label rank.
+    y_window = (label_np > 0).any(axis=tuple(range(1, label_np.ndim))).astype(np.int64)
     return X_flat, y_window
 
 
