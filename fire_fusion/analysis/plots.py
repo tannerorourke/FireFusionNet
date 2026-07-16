@@ -171,22 +171,23 @@ def reliability_diagram(
 
 def plot_XY_grid(
     grid_2d: np.ndarray,
-    water_mask: torch.Tensor | np.ndarray | None = None,
+    land_mask: torch.Tensor | np.ndarray | None = None,
     title: str = "",
     vmin: float | None = None,
     vmax: float | None = None,
     save_path: str | None = None,
 ):
     """
-    Plot a heatmap of a continuous field [H, W] with water cells in black.
+    Plot a heatmap of a continuous field [H, W]. Takes the dataset's land_mask
+    (1 = land) as-is and renders everything it excludes in black.
     """
     data = np.array(grid_2d, dtype=float)
 
-    if water_mask is not None:
-        if isinstance(water_mask, torch.Tensor):
-            water_mask = water_mask.detach().cpu().numpy()
-        water_mask = np.array(water_mask).astype(bool)
-        data = np.ma.masked_where(water_mask, data)
+    if land_mask is not None:
+        if isinstance(land_mask, torch.Tensor):
+            land_mask = land_mask.detach().cpu().numpy()
+        land_mask = np.array(land_mask).astype(bool)
+        data = np.ma.masked_where(~land_mask, data)
 
     cmap = plt.cm.get_cmap("coolwarm").copy()
     cmap.set_bad(color="black")
@@ -212,7 +213,7 @@ def plot_XY_grid(
 
 def plot_label_grid_time_t(
     labels: torch.Tensor | np.ndarray,
-    water_mask: torch.Tensor | np.ndarray | None = None,
+    land_mask: torch.Tensor | np.ndarray | None = None,
     time_idx: int | None = None,
     title: str = "Fire labels",
     save_path: str | None = None,
@@ -221,7 +222,7 @@ def plot_label_grid_time_t(
     Plot binary labels as a discrete heatmap:
       - 0 (no fire) = blue
       - 1 (fire)    = red
-      - water       = black
+      - non-land    = black
     labels can be:
       - [T, H, W]
       - [H, W]
@@ -245,11 +246,11 @@ def plot_label_grid_time_t(
 
     grid_2d = grid_2d.astype(float)
 
-    if water_mask is not None:
-        if isinstance(water_mask, torch.Tensor):
-            water_mask = water_mask.detach().cpu().numpy()
-        water_mask = np.array(water_mask).astype(bool)
-        grid_2d = np.ma.masked_where(water_mask, grid_2d)
+    if land_mask is not None:
+        if isinstance(land_mask, torch.Tensor):
+            land_mask = land_mask.detach().cpu().numpy()
+        land_mask = np.array(land_mask).astype(bool)
+        grid_2d = np.ma.masked_where(~land_mask, grid_2d)
 
     cmap = ListedColormap(["blue", "red"])
     cmap.set_bad(color="black")

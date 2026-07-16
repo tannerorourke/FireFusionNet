@@ -318,16 +318,26 @@ class BinaryAUC(Metric):
 
 
 class MetricsManager:
-    def __init__(self, num_classes: Tuple = (2,)):
+    def __init__(
+        self,
+        num_classes: Tuple = (2,),
+        select_by: Literal["pr_auc", "val_loss"] = "pr_auc",
+    ):
         """
         num_classes: Tuple with number of classes per prediction head
             e.g. one binary classifier + separate 4-class head -> (2, 4)
+        select_by: what "best epoch" and early stopping key off.
+            "pr_auc"   - masked PR-AUC of the ignition head (maximized)
+            "val_loss" - total validation loss (minimized), which sums both
+                         heads and so mixes the sparse cause term into the
+                         choice of checkpoint
         """
         assert num_classes and num_classes[0] == 2, \
             "head 0 is the binary ignition head; its ranking scores assume a single logit"
 
         self.num_classes = num_classes
         self.num_heads = len(num_classes)
+        self.select_by = select_by
 
         self.trn_accuracies = [Accuracy() for _ in range(self.num_heads)]
         self.val_accuracies = [Accuracy() for _ in range(self.num_heads)]
@@ -344,11 +354,17 @@ class MetricsManager:
 
         self.best = {
             "epoch": 0,
-            "score": float("inf"),
-            "ign_err": float("inf"),
+            "score": -float("inf") if select_by == "pr_auc" else float("inf"),
         }
         self.epoch = 1
         self.no_improve = 0
+
+    def _is_improvement(self, score: float) -> bool:
+        if self.select_by == "pr_auc":
+            # an epoch whose eval split carried no positives scores nan and
+            # cannot be ranked against anything
+            return bool(np.isfinite(score)) and score > self.best["score"]
+        return score < self.best["score"]
 
     @staticmethod
     def _logits_to_preds(logits: torch.Tensor, n_classes: int) -> torch.Tensor:
@@ -459,7 +475,12 @@ class MetricsManager:
 
         trn_last = self.trn_losses[:, -1]
         val_last = self.val_losses[:, -1]
-        score = float(val_last[0])  # total validation loss
+
+        # the ignition head's ranking quality is the claim under test; total
+        # validation loss also carries the sparse, high-variance cause term
+        score = float(
+            ign_scores["pr_auc"] if self.select_by == "pr_auc" else val_last[0]
+        )
 
         trn_total, trn_ign, trn_cause = trn_last[:3]
         val_total, val_ign, val_cause = val_last[:3]
@@ -477,11 +498,11 @@ class MetricsManager:
             f"ROC-AUC: {ign_scores['roc_auc']:.4f}, "
             f"F1: {ign_scores['f1']:.4f}, "
             f"recall: {ign_scores['recall']:.4f}\n"
-            f"         SCORE: {score:.4f}"
+            f"         SCORE ({self.select_by}): {score:.5f}"
         )
 
         new_best = False
-        if score < self.best["score"]:
+        if self._is_improvement(score):
             print(f"NEW BEST! SCORE={score:.5f}\n")
             new_best = True
             self.best["epoch"] = self.epoch

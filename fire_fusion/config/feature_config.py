@@ -128,6 +128,7 @@ def get_labels():
     return [l for l in drv_feat_config() if l.is_label==True]
 
 def get_masks():
+    """ For all masks, equals 1 where the cell is usable for the head it gates """
     return (
         [f for f in drv_feat_config() if f.is_mask==True] +
         [f for feats in base_feat_config().values() for f in feats if f.is_mask==True]
@@ -342,8 +343,8 @@ def drv_feat_config() -> List[Feature]:
             func="build_ignition_next",
             inputs=["usfs_burn_occ", "usfs_perimeter"],
         ),
-        Feature(name="act_fire_mask", is_mask=True, 
-            func="build_act_fire_mask",
+        Feature(name="no_act_fire_mask", is_mask=True,
+            func="build_no_act_fire_mask",
             inputs=["usfs_burn_occ", "usfs_perimeter"],
         ),
         Feature(name = "fire_spatial_roll",
@@ -361,8 +362,8 @@ def drv_feat_config() -> List[Feature]:
             inputs=["usfs_burn_cause", "ign_next"],
             drop_inputs=["usfs_burn_cause"],
         ),
-        Feature(name="water_mask", is_mask=True,
-            func="build_water_mask",
+        Feature(name="land_mask", is_mask=True,
+            func="build_land_mask",
             inputs=["modis_water_mask"],
             drop_inputs=["modis_water_mask"],
         ),

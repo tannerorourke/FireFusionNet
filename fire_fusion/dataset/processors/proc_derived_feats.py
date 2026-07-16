@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional, Tuple
 import pandas as pd
 import xarray as xr
 import numpy as np
@@ -8,7 +8,21 @@ class DerivedProcessor:
     """
         1. Build labels and masks
         2. Build other features. Group so extracted data can be (conditionally) dropped cleanly
+
+    Derivations that reference a statistic of the record (rather than a single
+    day) take that statistic from the train split only; `train_yrs` carries the
+    split boundary in. Leaving it None uses the whole record and is only
+    appropriate outside of a modelling context.
     """
+    def __init__(self, train_yrs: Optional[Tuple[int, int]] = None):
+        self.train_yrs = train_yrs
+
+    def _train_slice(self, da: xr.DataArray) -> xr.DataArray:
+        if self.train_yrs is None or "time" not in da.dims:
+            return da
+        y0, y1 = self.train_yrs
+        return da.sel(time=slice(f"{y0}-01-01", f"{y1}-12-31"))
+
     # -- Labels -----------------------------------------------------------------------------------
     def build_ignition_next(self, subds: xr.Dataset, name: str) -> xr.DataArray:
         """ 1. Burning = burn label from modis, USFS occurence, or USFS perimeter
@@ -24,14 +38,17 @@ class DerivedProcessor:
         ign_next_label.name = name
         return ign_next_label
     
-    def build_act_fire_mask(self, subds: xr.Dataset, name: str) -> xr.DataArray:
+    def build_no_act_fire_mask(self, subds: xr.Dataset, name: str) -> xr.DataArray:
+        """ 1 where nothing is burning at time t -- a cell already on fire cannot
+            be a fresh ignition, so it carries no ignition supervision.
+        """
         burning_t = (
-            (subds["usfs_burn_occ"].fillna(0) > 0) | 
+            (subds["usfs_burn_occ"].fillna(0) > 0) |
             (subds["usfs_perimeter"].fillna(0) > 0)
         )
-        act_ign_mask = (burning_t == 0).astype("uint8")
-        act_ign_mask.name = name
-        return act_ign_mask
+        no_act_fire_mask = (burning_t == 0).astype("uint8")
+        no_act_fire_mask.name = name
+        return no_act_fire_mask
     
     def build_fire_spatial_rolling(self, subds: xr.Dataset, name: str, kernel = 3, t_window = 3) -> xr.DataArray:
         """ 3x3 kernel max of active fires at time = T
@@ -97,16 +114,25 @@ class DerivedProcessor:
         valid_cause_mask.name = name
         return valid_cause_mask
     
-    def build_water_mask(self, subds: xr.Dataset, name: str) -> xr.DataArray:
-        water_mask = (
-            subds["modis_water_mask"].fillna(0) > 0
-        )
-        water_mask.name = name
-        return water_mask
+    def build_land_mask(self, subds: xr.Dataset, name: str) -> xr.DataArray:
+        """ 1 where the cell is land. MODIS flags deep water; anything it does
+            not flag (including cells it never observed) is treated as land.
+        """
+        land_mask = (
+            subds["modis_water_mask"].fillna(0) == 0
+        ).astype("uint8")
+        land_mask.name = name
+        return land_mask
 
 
     # -- Other Features ---------------------------------------------------------------------------
     def build_ndvi_anomaly(self, subds: xr.Dataset, name: str) -> xr.DataArray:
+        """ NDVI minus its day-of-year climatology, where the climatology is an
+            average over the train years only. A climatology spanning the whole
+            record would carry eval/test vegetation into every training sample
+            and let each held-out day contribute to the mean it is measured
+            against.
+        """
         ndvi = subds['modis_ndvi']
         doy = ndvi["time"].dt.dayofyear
 
@@ -115,9 +141,17 @@ class DerivedProcessor:
         # axis into per-day chunks, which explodes the task graph downstream.
         # Assumes spatial dims are unchunked (the build keeps full-extent
         # spatial chunks throughout).
-        clim = ndvi.groupby(doy).mean("time").compute()
+        ref = self._train_slice(ndvi)
+        clim = ref.groupby(ref["time"].dt.dayofyear).mean("time").compute()
         clim_np = clim.values.astype("float32")
-        pos = np.searchsorted(clim["dayofyear"].values, doy.values)
+
+        # Days the train split never observed (Feb 29 when no train year is a
+        # leap year) fall back to the nearest day-of-year that it did.
+        observed = clim["dayofyear"].values
+        right = np.searchsorted(observed, doy.values).clip(0, len(observed) - 1)
+        left = (right - 1).clip(0, len(observed) - 1)
+        take_left = np.abs(observed[left] - doy.values) <= np.abs(observed[right] - doy.values)
+        pos = np.where(take_left, left, right)
         pos_da = xr.DataArray(pos, dims=("time",), coords={"time": ndvi["time"]})
 
         def _subtract_clim(nd, p):

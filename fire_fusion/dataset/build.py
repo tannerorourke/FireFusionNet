@@ -205,7 +205,9 @@ class FeatureGrid:
     def _apply_derived(self, ds: xr.Dataset) -> xr.Dataset:
         print(f"[FeatureGrid] Deriving anti-arson techniques through feature derivation..")
 
-        drv_processor = DerivedProcessor()
+        # derivations that average over the record (the NDVI climatology) must
+        # see the train years only
+        drv_processor = DerivedProcessor(train_yrs=self.cfg.train_yrs)
         for cfg in self.drv_config:
             func        = cfg.func
             inputs      = cfg.inputs
@@ -329,11 +331,11 @@ class FeatureGrid:
             f"{self.cfg.train_yrs[0]}-01-01", f"{self.cfg.train_yrs[1]}-12-31"
         )
         ign = ds["ign_next"].sel(time=train_slice)
-        fire_mask = ds["act_fire_mask"].sel(time=train_slice)
-        water_mask = ds["water_mask"].sel(time=train_slice)
+        no_act_fire_mask = ds["no_act_fire_mask"].sel(time=train_slice)
+        land_mask = ds["land_mask"].sel(time=train_slice)
 
-        # land pixels (water_mask: 1 = water) that are not already burning
-        ign_valid = ign.where((water_mask == 0) & (fire_mask == 1))
+        # the population the ignition head is supervised on
+        ign_valid = ign.where((land_mask == 1) & (no_act_fire_mask == 1))
         n_ign_pos, n_ign_neg = dask.compute(
             (ign_valid == 1).sum(), (ign_valid == 0).sum()
         )

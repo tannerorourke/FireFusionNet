@@ -58,7 +58,8 @@ class WRMTrainer:
         print(f"[WRMTrainer] dataset={dataset_name} in_channels={in_channels} "
               f"out_size={model_params['out_size']} "
               f"cause_classes={model_params['n_cause_classes']} "
-              f"pos_weight={ign_pos_weight:.2f}")
+              f"pos_weight={ign_pos_weight:.2f} "
+              f"prevalence={1.0 / max(ign_pos_weight, 1e-9):.2e} (PR-AUC baseline)")
 
         self.model = FireFusionModel(in_channels, mp=model_params).to(self.device)
 
@@ -74,7 +75,12 @@ class WRMTrainer:
             [float(ign_pos_weight)], dtype=torch.float32, device=device
         )
         self.bcewl_loss = nn.BCEWithLogitsLoss(reduction="none", pos_weight=self.ign_pos_weight)
-        self.mm = MetricsManager(num_classes=(2, train_set.n_cause_classes))
+        # best epoch / early stopping key off the ignition head's masked PR-AUC
+        # rather than total validation loss: it is the reported claim, and it
+        # excludes the sparse cause term from the choice of checkpoint
+        self.mm = MetricsManager(
+            num_classes=(2, train_set.n_cause_classes), select_by="pr_auc"
+        )
 
         if mode == "train": self.train()
         else: self.test()
@@ -91,11 +97,11 @@ class WRMTrainer:
         """
         ign_golds = self._last_day(golds["ign_next"])
         cause_golds = self._last_day(golds["ign_next_cause"])
-        act_fire_mask = self._last_day(masks["act_fire_mask"])
-        water_mask = self._last_day(masks["water_mask"])
+        no_act_fire_mask = self._last_day(masks["no_act_fire_mask"])
+        land_mask = self._last_day(masks["land_mask"])
 
-        # equals 1 if land (water_mask: 1 = water) and not burning at time T
-        ign_mask = (water_mask == 0) & (act_fire_mask == 1)
+        # masks read 1 where the cell is usable, so this is an AND of the two
+        ign_mask = (land_mask == 1) & (no_act_fire_mask == 1)
 
         # cause is only defined where an ignition at t+1 carries a known cause
         cause_mask = (ign_golds == 1) & (cause_golds != -1) & ign_mask
