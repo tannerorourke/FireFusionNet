@@ -41,17 +41,31 @@ class DerivedProcessor:
             (subds["usfs_burn_occ"].fillna(0) > 0) | 
             (subds["usfs_perimeter"].fillna(0) > 0)
         )
-        burn_rolling = burning_t.rolling(time=t_window, min_periods=1).max().fillna(0)
+        # rolling pads with a dtype-dependent fill value; bool input breaks under dask
+        burn_rolling = (
+            burning_t.astype("float32")
+            .rolling(time=t_window, min_periods=1).max()
+            .fillna(0)
+            .astype("float32")
+        )
 
         assert burn_rolling.dims == ("time", "y", "x"), f"Unexpected dims: {burn_rolling.dims}"
 
-        burn_filter = maximum_filter(burn_rolling.values.astype(np.uint8), size=(1, kernel, kernel))
-        return xr.DataArray(
-            burn_filter,
-            dims=burn_rolling.dims,
-            coords=burn_rolling.coords,
-            name=name,
+        # kernel spans spatial dims only, so per-chunk application is exact as
+        # long as chunks cover the full spatial extent (rolling may have split
+        # them; a 3x3 max over partial spatial chunks would miss neighbors)
+        if burn_rolling.chunks is not None:
+            burn_rolling = burn_rolling.chunk({"y": -1, "x": -1})
+
+        burn_filter = xr.apply_ufunc(
+            maximum_filter,
+            burn_rolling,
+            kwargs={"size": (1, kernel, kernel)},
+            dask="parallelized",
+            output_dtypes=[np.float32],
         )
+        burn_filter.name = name
+        return burn_filter
 
     def build_ign_next_cause(self, subds: xr.Dataset, name: str) -> xr.DataArray:
         """ 1. One hot encode burn cause dim (fill = -1's)
@@ -93,8 +107,28 @@ class DerivedProcessor:
 
     # -- Other Features ---------------------------------------------------------------------------
     def build_ndvi_anomaly(self, subds: xr.Dataset, name: str) -> xr.DataArray:
-        ndvi_by_doy = subds['modis_ndvi'].groupby("time.dayofyear")
-        ndvi_anom = ndvi_by_doy - ndvi_by_doy.mean("time")
+        ndvi = subds['modis_ndvi']
+        doy = ndvi["time"].dt.dayofyear
+
+        # Materialize the day-of-year climatology once and subtract it via a
+        # per-chunk positional lookup. A groupby subtraction shatters the time
+        # axis into per-day chunks, which explodes the task graph downstream.
+        # Assumes spatial dims are unchunked (the build keeps full-extent
+        # spatial chunks throughout).
+        clim = ndvi.groupby(doy).mean("time").compute()
+        clim_np = clim.values.astype("float32")
+        pos = np.searchsorted(clim["dayofyear"].values, doy.values)
+        pos_da = xr.DataArray(pos, dims=("time",), coords={"time": ndvi["time"]})
+
+        def _subtract_clim(nd, p):
+            return (nd - clim_np[p.reshape(p.shape[0])]).astype("float32")
+
+        ndvi_anom = xr.apply_ufunc(
+            _subtract_clim,
+            ndvi, pos_da,
+            dask="parallelized",
+            output_dtypes=[np.float32],
+        )
         ndvi_anom.name = name
         return ndvi_anom
     
@@ -107,16 +141,16 @@ class DerivedProcessor:
         return xr.Dataset({ names[0]: p2d, names[1]: p5d })
          
     def build_wind_ew_ns(self, subds: xr.Dataset, names: List[str]) -> xr.Dataset:
-        rads = xr.apply_ufunc(np.deg2rad, subds["wind_dir"])
-        val_ew = - xr.apply_ufunc(np.sin, rads).astype("float32")
-        val_ns = - xr.apply_ufunc(np.cos, rads).astype("float32")
+        rads = xr.apply_ufunc(np.deg2rad, subds["wind_dir"], dask="allowed")
+        val_ew = - xr.apply_ufunc(np.sin, rads, dask="allowed").astype("float32")
+        val_ns = - xr.apply_ufunc(np.cos, rads, dask="allowed").astype("float32")
 
         return xr.Dataset({ names[0]:val_ew, names[1]:val_ns })
     
     def build_aspect_ew_ns(self, subds: xr.Dataset, names: List[str]) -> xr.Dataset:
-        rads = xr.apply_ufunc(np.deg2rad, subds["lf_aspect"])
-        val_ew = xr.apply_ufunc(np.sin, rads).astype("float32")
-        val_ns = xr.apply_ufunc(np.cos, rads).astype("float32")
+        rads = xr.apply_ufunc(np.deg2rad, subds["lf_aspect"], dask="allowed")
+        val_ew = xr.apply_ufunc(np.sin, rads, dask="allowed").astype("float32")
+        val_ns = xr.apply_ufunc(np.cos, rads, dask="allowed").astype("float32")
 
         return xr.Dataset({ names[0]:val_ew, names[1]:val_ns })
     
@@ -153,34 +187,27 @@ class DerivedProcessor:
 
 
     def build_doy_sin(self, subds: xr.Dataset, name: str, gridref: xr.DataArray) -> xr.DataArray:
-        """ NOTE: Used LLM for help debugging this function"""
-
         # time index to numpy
         time_index = pd.DatetimeIndex(subds.indexes["time"])
         doy = time_index.dayofyear.to_numpy(dtype="float32")
 
         # sin encoding on 0, 2pi
         phase = 2.0 * np.pi * (doy - 1.0) / 365.0
-        time_signal = np.sin(phase).astype("float32")
-
-        # Broadcast over spatial grid
-        ny = gridref.sizes["y"]
-        nx = gridref.sizes["x"]
-        data = np.broadcast_to(
-            time_signal[:, None, None], 
-            shape=(len(time_index), ny, nx)
-        ).astype("float32")
-
-        # Wrap as T, Y, X feature
-        return xr.DataArray(
-            data=data,
-            dims=("time", "y", "x"),
-            coords={
-                "time": time_index,
-                "y": gridref["y"].values, "x": gridref["x"].values,
-            },
-            name=name,
+        time_signal = xr.DataArray(
+            np.sin(phase).astype("float32"),
+            dims=("time",),
+            coords={"time": time_index},
         )
+
+        # Broadcast against a (time, y, x) variable from the dataset so the
+        # result inherits its layout (and stays lazy when inputs are dask)
+        template = next(
+            da for da in subds.data_vars.values() if da.dims == ("time", "y", "x")
+        )
+        doy_map = (time_signal * xr.ones_like(template, dtype="float32"))
+        doy_map = doy_map.transpose("time", "y", "x")
+        doy_map.name = name
+        return doy_map
     
     # def build_wui_index(self, subds: xr.Dataset, name: str, wildland_ixs = [4, 5, 7]) -> xr.DataArray:
     #     """

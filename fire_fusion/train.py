@@ -27,7 +27,7 @@ class WRMTrainer:
         training_params: Dict,
         device: torch.device,
         num_workers: int = 0,
-        in_channels: int = 29,
+        dataset_name: str = "wa2000",
         mode: Literal['train', 'test'] = 'train',
         debug: bool = False
     ):
@@ -35,8 +35,23 @@ class WRMTrainer:
         self.use_amp = bool(device.type == "cuda")
         self.debug = debug
 
-        self.train_loader = init_data_loader("train", num_workers, training_params["batch_size"])
-        self.eval_loader = init_data_loader("eval", num_workers, training_params["batch_size"])
+        self.train_loader = init_data_loader(
+            "train", dataset_name, num_workers, training_params["batch_size"]
+        )
+        self.eval_loader = init_data_loader(
+            "eval", dataset_name, num_workers, training_params["batch_size"]
+        )
+
+        # channel count, output size, and class balance come from the built
+        # dataset's manifest, not from hardcoded params
+        train_set = self.train_loader.dataset
+        model_params = dict(model_params)
+        model_params["out_size"] = list(train_set.out_size)
+        in_channels = train_set.in_channels
+        ign_pos_weight = train_set.ign_pos_weight
+        print(f"[WRMTrainer] dataset={dataset_name} in_channels={in_channels} "
+              f"out_size={model_params['out_size']} pos_weight={ign_pos_weight:.2f}")
+
         self.model = FireFusionModel(in_channels, mp=model_params).to(self.device)
 
 
@@ -48,7 +63,7 @@ class WRMTrainer:
         self.grad_clip = training_params["grad_clip"]
         
         self.ign_pos_weight = torch.as_tensor(
-            [float(training_params["ign_pos_weight"])], dtype=torch.float32, device=device
+            [float(ign_pos_weight)], dtype=torch.float32, device=device
         )
         self.bcewl_loss = nn.BCEWithLogitsLoss(reduction="none", pos_weight=self.ign_pos_weight)
         self.mm = MetricsManager(num_classes=(2, 3))
@@ -68,15 +83,8 @@ class WRMTrainer:
         """ Compute BCELogitsLoss on ignition at time t + 1,
             as well as cross entropy loss on ignition TYPE given an ignition
         """
-        print("Shapes")
-        print("ign_logits: ", ign_logits.shape)
-        print("ign_golds: ", ign_golds.shape)
-        print("cause_logits: ", cause_logits.shape)
-        print("cause_golds: ", cause_golds.shape)
-        print("act_fire_mask: ", act_fire_mask.shape)
-        print("water_mask: ", water_mask.shape)
-
         # === Collapse TIME DIMENSION to final step T + 1
+        # (loaders emitting per-window labels already deliver (B, H, W))
         if ign_golds.ndim == 4:          # (B, T, H, W)
             ign_golds = ign_golds[:, -1] # (B, H, W)
         if cause_golds.ndim == 4:
@@ -87,16 +95,8 @@ class WRMTrainer:
         if water_mask.ndim == 4:
             water_mask = water_mask[:, -1]       # (B, H, W)
 
-        # equals 1 if (land) and (not burning at time T)
-        ign_mask = (water_mask == 1) & (act_fire_mask == 1)
-
-        print("Shapes")
-        print("ign_logits: ", ign_logits.shape)
-        print("ign_golds: ", ign_golds.shape)
-        print("cause_logits: ", cause_logits.shape)
-        print("cause_golds: ", cause_golds.shape)
-        print("act_fire_mask: ", act_fire_mask.shape)
-        print("water_mask: ", water_mask.shape)
+        # equals 1 if land (water_mask: 1 = water) and not burning at time T
+        ign_mask = (water_mask == 0) & (act_fire_mask == 1)
 
         # === Ignition Loss: on ignition at t = t+1 ===============
         ign_logits_flat = ign_logits.squeeze(1)
@@ -117,7 +117,7 @@ class WRMTrainer:
         cause_mask = (ign_golds == 1) & (cause_golds != -1) & ign_mask
         if cause_mask.any():
             cause_logits_flat = cause_logits.permute(0, 2, 3, 1)[cause_mask]
-            cause_targets_flat = cause_golds[cause_mask]
+            cause_targets_flat = cause_golds[cause_mask].long()
 
             cause_loss = nn.functional.cross_entropy(
                 cause_logits_flat, 
@@ -142,7 +142,7 @@ class WRMTrainer:
             golds = { k: v.to(self.device) for k, v in golds.items() }
             masks = { k: v.to(self.device) for k, v in masks.items() }
 
-            if epoch == 1:
+            if epoch == 1 and self.debug:
                 print(f"[DataCheck] X shape: {tuple(X.shape)}  (expected: B, T, C, H, W)")
                 # Basic tensor stats
                 print(f"[DataCheck] Feature min/max: {X.min().item():.4f} / {X.max().item():.4f}")
@@ -315,22 +315,27 @@ class WRMTrainer:
         
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Train FireFusionNet on a built dataset")
+    parser.add_argument("--dataset", default="wa2000")
+    parser.add_argument("--profile", default="sanity", help="params.json profile")
+    args = parser.parse_args()
+
     set_global_seed(42)
     device, num_workers = get_device_config(maximum=2)
 
     """ Model Params """
     with open(f'{MODEL_DIR}/params.json') as file:
         data = json.load(file)
-        params = data["sanity"]
+        params = data[args.profile]
 
-    in_channels         = 29
     model_params        = params["model"]
     training_params     = params["training"]
 
     wt = WRMTrainer(
         model_params, training_params,
         device, num_workers,
-        in_channels,
+        dataset_name = args.dataset,
         mode = "train",
         debug = False
     )

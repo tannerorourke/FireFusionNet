@@ -6,9 +6,8 @@ DATA_ROOT     = PROJECT_ROOT / "data"
 FF_ROOT = PROJECT_ROOT / "fire_fusion"
 
 RAW_DATA_DIR  = DATA_ROOT / "raw"
-TRAIN_DATA_DIR = DATA_ROOT / "train"
-EVAL_DATA_DIR = DATA_ROOT / "eval"
-TEST_DATA_DIR = DATA_ROOT / "test"
+# Built datasets live under data/processed/<dataset-name>/; see dataset_config.py
+PROCESSED_DATA_DIR = DATA_ROOT / "processed"
 
 LANDFIRE_DIR    = RAW_DATA_DIR / "landfire" / "downloaded"
 NLCD_DIR        = RAW_DATA_DIR / "nlcd" / "downloaded"

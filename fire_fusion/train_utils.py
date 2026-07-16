@@ -29,10 +29,10 @@ def get_device_config(maximum: int | None = None, utilization: float | None = 0.
 
     if utilization is not None:
         workers = math.floor(cpus * utilization)
-    elif maximum is not None:
-        workers = max(1, maximum)
     else:
         workers = 1
+    if maximum is not None:
+        workers = max(1, min(workers, maximum))
 
     if torch.cuda.is_available():
         print(f"Device: {device}, {torch.cuda.get_device_name(0)}")

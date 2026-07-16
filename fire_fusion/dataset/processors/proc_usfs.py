@@ -25,10 +25,7 @@ class UsfsFire(Processor):
 
             file = USFS_DIR / "National_USFS_Fire_Perimeter_(Feature_Layer).shp"
             layer = self._build_perim_layer(file, f_cfg)
-
-            layer = layer.to_dataset(name=f_cfg.name).sortby("time").transpose("time", "y", "x", ...)
-            return layer
-        
+            return layer.to_dataset(name=f_cfg.name)
 
         elif f_cfg.key == "Fire_Occurence":
             print(f"\n[USFS] computing fire occurence layer")
@@ -36,30 +33,22 @@ class UsfsFire(Processor):
 
             file = USFS_DIR / "National_USFS_Fire_Occurrence_Point_(Feature_Layer).shp"
             self.occ_cause_layer = layer = self._build_occ_cause_layers(file, f_cfg)
-
-            layer = layer.sortby("time").transpose("time", "y", "x", ...)
             return layer
-
 
         elif f_cfg.key == "Fire_KDE":
             print(f"\n[USFS] computing fire KDE")
 
-            # Apply a cum sum at each timestep T + gaussian filter to smooth Y/X
-            layer = self._build_kde_layers(f_cfg)
-            print({ 
-                name: {
-                    "shape": da.shape,
-                    "finite": int(np.isfinite(da).sum()),
-                    "min": float(da.where(np.isfinite(da)).min(skipna=True)),
-                    "max": float(da.where(np.isfinite(da)).max(skipna=True)),
-                    "mean": float(da.where(np.isfinite(da)).mean(skipna=True)),
-                    "unique": len(np.unique(da.values))
-                } 
-                for name, da in layer.data_vars.items()
-            })
-            layer = layer.sortby("time").transpose("time", "y", "x", ...)
-            return layer
-            
+            # One float32 (time, y, x) array per cause; at fine resolutions the
+            # full set does not fit in memory, so push each cause through the
+            # sink as soon as it is computed when the builder provides one
+            if self.sink is not None:
+                for name, da_kde in self._iter_kde_layers(f_cfg):
+                    self.sink(da_kde.to_dataset(name=name))
+                    del da_kde
+                return xr.Dataset()
+
+            return xr.Dataset(dict(self._iter_kde_layers(f_cfg)))
+
         return xr.Dataset()
     
 
@@ -187,8 +176,10 @@ class UsfsFire(Processor):
         return fire_occ_cause_tyx
     
 
-    def _build_kde_layers(self, f_cfg: Feature) -> xr.Dataset:
-    
+    def _iter_kde_layers(self, f_cfg: Feature):
+        """ Yield ("kde_<cause>", DataArray) one cause at a time so the caller
+            controls how many float32 cubes are alive simultaneously
+        """
         assert self.occ_cause_layer is not None, "Fire-KDE expected burn data/occurence layer pre-computed"
 
         fire_occurences = self.occ_cause_layer["usfs_burn_cause"]
@@ -203,27 +194,28 @@ class UsfsFire(Processor):
         sigma_pixels = (
             kde_radius / pixel_size_km if pixel_size_km > 0 else 0.0
         )
-        
+
         print(f"sigma pixels = {kde_radius} / {pixel_size_km} = {sigma_pixels}")
-        
+
         # Loop over burn causes, computing gaussian filter for each class.
         # Each timestep's map only accumulates fires observed up to that day:
         # smoothing is linear, so smoothing daily occurrences and cumsum-ing over
         # time is identical to smoothing the running cumulative map at every day
-        kde_by_class = {}
         for cause in fire_occurences.coords["burn_cause"].values:
-            occ_txy = fire_occurences.sel(burn_cause=cause).values.astype("float32")
+            # uint8 view of the occurrence stack; only fire days are cast/smoothed
+            occ_txy = fire_occurences.sel(burn_cause=cause).values
 
-            if occ_txy.sum() == 0:
+            kde_txy = np.zeros(occ_txy.shape, dtype="float32")
+            fire_days = np.flatnonzero(occ_txy.reshape(occ_txy.shape[0], -1).sum(axis=1) > 0)
+            if fire_days.size == 0:
                 print(f"WARNING: Sum of All X/Y across time is 0 for {cause}")
-                kde_txy = occ_txy
-            else:
-                smoothed = np.zeros_like(occ_txy)
-                fire_days = np.flatnonzero(occ_txy.reshape(occ_txy.shape[0], -1).sum(axis=1) > 0)
-                for t in fire_days:
-                    smoothed[t] = gaussian_filter(occ_txy[t], sigma=sigma_pixels, mode="constant")
-                kde_txy = np.cumsum(smoothed, axis=0, dtype="float32")
+            for t in fire_days:
+                kde_txy[t] = gaussian_filter(
+                    occ_txy[t].astype("float32"), sigma=sigma_pixels, mode="constant"
+                )
+            np.cumsum(kde_txy, axis=0, out=kde_txy)
 
+            name = f"kde_{str(cause).lower()}"
             da_kde = xr.DataArray(
                 kde_txy,
                 coords={
@@ -232,14 +224,9 @@ class UsfsFire(Processor):
                     "x": fire_occurences.coords["x"],
                 },
                 dims=("time", "y", "x"),
-                name=f"kde_{str(cause).lower()}"
+                name=name,
             )
-            kde_by_class[f"kde_{str(cause).lower()}"] = da_kde
-
-        kde_ds = xr.Dataset(kde_by_class)
-        kde_ds = kde_ds.rio.write_crs(self.gridref.rio.crs)
-        kde_ds = kde_ds.rio.write_transform(self.gridref.rio.transform())
-        return kde_ds
+            yield name, da_kde
 
 
     def _build_perim_layer(self, fp: Path, f_cfg: Feature) -> xr.DataArray:

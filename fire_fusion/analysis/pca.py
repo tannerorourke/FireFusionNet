@@ -11,7 +11,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 
 from ..dataset.data_loader import FireDataset, init_data_loader
-from ..config.path_config import TRAIN_DATA_DIR, EVAL_DATA_DIR
 
 
 def extract_features_and_labels_from_batch(batch):
