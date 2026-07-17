@@ -19,7 +19,7 @@ from .config.path_config import MODEL_DIR, PLOTS_DIR
 from .dataset.data_loader import init_data_loader
 from .model.model import FireFusionModel
 from .analysis.metrics import PlattScaler
-from .train_utils import load_model, load_calibration, get_device_config
+from .train_utils import load_model, load_calibration, get_device_config, checkpoint_name
 
 
 class FirePredictor:
@@ -51,29 +51,38 @@ class FirePredictor:
 
 
 def load_predictor(
-    dataset_name: str = "wa2000",
-    profile: str = "optimal",
-    checkpoint: str = "specialized_model.th",
+    dataset_name: str | None = None,
+    experiment: str = "smoke",
+    checkpoint: str | None = None,
     calib: str | None = None,
     device: torch.device | None = None,
 ) -> FirePredictor:
-    """ Rebuild the model at its trained shape, load weights, attach a calibrator.
+    """ Rebuild the model, load weights, attach a calibrator.
 
-    Channel count, grid size, cause classes, and the class weight come from the
-    dataset manifest (as at train time); the attention/embedding shape comes from
-    the params.json `profile` the checkpoint was trained with, so a mismatched
-    profile surfaces immediately as a strict state_dict error.
+    Channel count, cause classes, and the class weight come from the dataset
+    manifest (as at train time); the attention/embedding shape comes from the
+    params.json `experiment` the checkpoint was trained with, so a mismatched
+    experiment surfaces immediately as a strict state_dict error. The grid extent
+    is not a model parameter -- the output tracks whatever extent is fed in.
+
+    Dataset and checkpoint default to the ones the experiment trained against,
+    so an experiment name is enough to reload its run.
     """
     if device is None:
         device, _ = get_device_config(maximum=1)
 
-    manifest = json.loads(get_dataset_config(dataset_name).manifest_path.read_text())
+    with open(f"{MODEL_DIR}/params.json") as f:
+        params = json.load(f)[experiment]
+    if dataset_name is None:
+        dataset_name = params["dataset"]
+    if checkpoint is None:
+        checkpoint = f"{checkpoint_name(experiment, 'specialize')}.th"
+
+    manifest = json.loads(get_dataset_config(dataset_name or '').manifest_path.read_text())
     in_channels = int(manifest["in_channels"])
     pos_weight = float(manifest["ign_pos_weight"])
 
-    with open(f"{MODEL_DIR}/params.json") as f:
-        model_params = dict(json.load(f)[profile]["model"])
-    model_params["out_size"] = [int(manifest["grid"]["height"]), int(manifest["grid"]["width"])]
+    model_params = dict(params["model"])
     model_params["n_cause_classes"] = int(manifest["n_cause_classes"])
 
     model = FireFusionModel(in_channels, mp=model_params).to(device)
@@ -105,10 +114,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Predict per-cell ignition probability for t_{n+1}"
     )
-    parser.add_argument("--dataset", default="wa2000")
-    parser.add_argument("--profile", default="optimal",
-                        help="params.json profile the checkpoint was trained with")
-    parser.add_argument("--checkpoint", default="specialized_model.th")
+    parser.add_argument("--experiment", default="smoke",
+                        help="params.json experiment the checkpoint was trained with")
+    parser.add_argument("--dataset", default=None,
+                        help="override the dataset the experiment names")
+    parser.add_argument("--checkpoint", default=None,
+                        help="defaults to the experiment's specialized checkpoint")
     parser.add_argument("--calib", default=None,
                         help="calibration sidecar name; defaults to the checkpoint's")
     parser.add_argument("--split", default="eval", choices=["train", "eval", "test"])
@@ -116,8 +127,11 @@ if __name__ == "__main__":
                         help="how many batches to summarize and plot")
     args = parser.parse_args()
 
-    predictor = load_predictor(args.dataset, args.profile, args.checkpoint, args.calib)
-    loader = init_data_loader(args.split, args.dataset, num_workers=0, batch_size=1)
+    with open(f"{MODEL_DIR}/params.json") as f:
+        dataset = args.dataset or json.load(f)[args.experiment]["dataset"]
+
+    predictor = load_predictor(dataset, args.experiment, args.checkpoint, args.calib)
+    loader = init_data_loader(args.split, dataset, num_workers=0, batch_size=1)
 
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     for i, (features, _golds, masks) in enumerate(loader):

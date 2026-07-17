@@ -31,4 +31,5 @@ dependencies:
   - earthaccess
   - numcodecs
   - zarr=2.*
+  - boto3 # optional: only imported when exporting a run to S3
   - pip # keep pip available for any extras

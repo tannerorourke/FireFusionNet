@@ -24,6 +24,17 @@ def set_global_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
+def checkpoint_name(experiment: str, stage: str) -> str:
+    """ Checkpoint name for one (experiment, stage) pair.
+
+    Two runs differ only by which experiment and stage produced them, so both
+    belong in the name: a shared `main_model.th` would leave each experiment
+    overwriting the weights of the one before it.
+    """
+    kind = "main" if stage == "pretrain" else "specialized"
+    return f"{experiment}_{kind}_model"
+
+
 def get_device_config(maximum: int | None = None, utilization: float | None = 0.75):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cpus = os.cpu_count() or 1
@@ -64,6 +75,40 @@ def save_model(
     torch.save(model.state_dict(), output_path)
 
     return str(output_path)
+
+
+def export_to_s3(
+    *files: str | Path,
+    prefix: str = "firefusion",
+    bucket: str | None = None,
+    region: str | None = None,
+) -> bool:
+    """ Upload finished run artifacts to `s3://<bucket>/<prefix>/<filename>`.
+
+    Bucket and region fall back to AWS_S3_BUCKET / AWS_REGION. Reports and
+    returns False rather than raising: this runs after the weights are already on
+    local disk, so a credentials or network problem should not take down an
+    otherwise complete run.
+    """
+    bucket = bucket or os.environ.get("AWS_S3_BUCKET")
+    if not bucket:
+        print("[export_to_s3] AWS_S3_BUCKET unset, skipping upload")
+        return False
+
+    try:
+        import boto3
+        client = boto3.client("s3", region_name=region or os.environ.get("AWS_REGION") or None)
+        for f in files:
+            path = Path(f)
+            if not path.exists():
+                print(f"[export_to_s3] {path.name} missing locally, skipping")
+                continue
+            client.upload_file(str(path), bucket, f"{prefix}/{path.name}")
+            print(f"[export_to_s3] s3://{bucket}/{prefix}/{path.name}")
+        return True
+    except Exception as e:
+        print(f"[export_to_s3] upload failed ({type(e).__name__}): {e}")
+        return False
 
 
 def load_model(

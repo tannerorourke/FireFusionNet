@@ -4,11 +4,7 @@ Modeling pipeline for wildfire ignition & cause prediction, aggregating geograph
 
 See accompanying paper: `Multi-Modal-Spatio-Temporal-Learning-for-Wildfire-Ignition-Modeling.pdf`
 
-## Citation
-
-Paper submission is in progress. Feel free to use the work at will under MIT Liscense.
-
-## Data Sources
+## Data Pipeline/Sourcing
 
 The data sourcing for this project is inspired by the [SeasFire Datacube](https://arxiv.org/pdf/2312.07199) (Karasante et. al, 2022).
 
@@ -42,6 +38,10 @@ The resulting dataset (*HF Dataset coming soon!*) combines 30 features covering 
 - 2-day and 5-day precipitation
 - Fosberg Fire Weather Index
 
+### Data Availability
+
+The dataset was created using a multiple of gated API tokens and requested bulk downloads. If you wish to rebuild the dataset from scratch, please reach out to me personally.
+
 ## Modeling
 
 A Spatio-Temporal ConvFormer (CNN + Transformer) performs attention over each axis of concern:
@@ -57,6 +57,21 @@ $$
 P(\text{fire}_{i,j}^{(t+1:t+K-1)}\text{ | }¬\text{fire}_{i,j}^{(t)})
 $$
 
-## Forking/Reproducing
+## Experiments
 
-If you wish to rebuild the dataset from scratch, I'd recommend reacing out to me personally - it was created using a variety of gated API tokens, requested bulk downloads, and some elbow grease.
+6 dataset/seed combinations are defined in `model/params.json` which the model is trained against (below). Checkpoints are written as `<experiment>_<main|specialized>_model.th`.
+
+| Experiment | Dataset | Grid | Purpose |
+| --- | --- | --- | --- |
+| `smoke` (not reported) | wa2000 | 204x220 | Minimal testing run: 2 epochs, 32px crops, runs on a potato! |
+| `wa2000-s{1,2}` | wa2000 | 204x220 | Full-grid training at 2km |
+| `wa1000-s{1,2}` | wa1000 | 408x436 | 1km, supervised on 128px halo crops |
+| `cascades250-s{1,2}` | cascades250 | 696x856 | 250m Eastern Cascades corridor, 128px halo crops |
+
+Reported results are the mean over the two seeds per dataset. the seed pairs are otherwise identical configurations.
+
+## Commands
+
+- `python -m fire_fusion.dataset.build --[dataset]`: Run the data extraction pipeline.
+- `python -m fire_fusion.model.train --[experiment] --[dataset] --[seed] --[stage] --[init-from] --[freeze] --[alpha-ign] --[alpha-cause] --[export-s3]`: Train the ConvFormer model. Requires a built dataset under `data/processed`.
+- `python -m fire_fusion.model.predict --[experiment] --[dataset] --[checkpoint] --[calib] --[split] --[batches]`: Turn a trained checkpoint into per-cell ignition probabilities.

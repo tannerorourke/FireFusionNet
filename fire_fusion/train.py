@@ -11,10 +11,10 @@ from time import perf_counter
 
 from .dataset.data_loader import init_data_loader
 from .model.model import FireFusionModel
-from .config.path_config import MODEL_DIR, PLOTS_DIR
+from .config.path_config import MODEL_DIR, MODEL_SAVE_DIR, PLOTS_DIR
 from .train_utils import (
-    estimate_model_size_mb, set_global_seed, get_device_config,
-    save_model, load_model, save_calibration, WarmupCosineAnnealingLR
+    estimate_model_size_mb, set_global_seed, get_device_config, checkpoint_name,
+    save_model, load_model, save_calibration, export_to_s3, WarmupCosineAnnealingLR
 )
 from .analysis.metrics import MetricsManager, PlattScaler, expected_calibration_error
 from .analysis.plots import (
@@ -30,19 +30,31 @@ class WRMTrainer:
         device: torch.device,
         num_workers: int = 0,
         dataset_name: str = "wa2000",
+        experiment: str = "smoke",
+        seed: int = 42,
         mode: Literal['train', 'test'] = 'train',
         stage: Literal['pretrain', 'specialize'] = 'pretrain',
         init_from: str | None = None,
         freeze: Literal['none', 'main', 'heads'] = 'none',
         alpha_ign: float = 1.0,
         alpha_cause: float = 1.0,
+        export_s3: bool = False,
         debug: bool = False
     ):
+        # seeded before anything draws: weight init, dropout, shuffling, and crop
+        # origins all read from RNGs that are seeded here or derived from them
+        self.seed = seed
+        set_global_seed(seed)
+
         self.device = device;
         self.use_amp = bool(device.type == "cuda")
         self.debug = debug
 
+        self.dataset_name = dataset_name
+        self.experiment = experiment
+        self.export_s3 = export_s3
         self.stage = stage
+        self.stage_base = checkpoint_name(experiment, stage)
         self.freeze = freeze
         self.alpha_ign = alpha_ign
         self.alpha_cause = alpha_cause
@@ -53,22 +65,24 @@ class WRMTrainer:
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
         self.train_loader = init_data_loader(
-            "train", dataset_name, num_workers, training_params["batch_size"]
+            "train", dataset_name, num_workers, training_params["batch_size"],
+            crop_size=training_params.get("crop_size"), seed=seed,
         )
         self.eval_loader = init_data_loader(
-            "eval", dataset_name, num_workers, training_params["batch_size"]
+            "eval", dataset_name, num_workers, training_params["batch_size"],
+            seed=seed,
         )
 
         # channel count, output size, cause classes, and class balance come from
         # the built dataset's manifest, not from hardcoded params
         train_set = self.train_loader.dataset
         model_params = dict(model_params)
-        model_params["out_size"] = list(train_set.out_size)
         model_params["n_cause_classes"] = train_set.n_cause_classes
         in_channels = train_set.in_channels
         ign_pos_weight = train_set.ign_pos_weight
+        print(f"[WRMTrainer] experiment={experiment} seed={seed}")
         print(f"[WRMTrainer] dataset={dataset_name} in_channels={in_channels} "
-              f"out_size={model_params['out_size']} "
+              f"grid={list(train_set.out_size)} "
               f"cause_classes={model_params['n_cause_classes']} "
               f"pos_weight={ign_pos_weight:.2f} "
               f"prevalence={1.0 / max(ign_pos_weight, 1e-9):.2e} (PR-AUC baseline)")
@@ -299,7 +313,7 @@ class WRMTrainer:
             selection also reads, so the reported ECE is mildly optimistic; a
             dedicated calibration split would remove that.
         """
-        stage_base = "main_model" if self.stage == "pretrain" else "specialized_model"
+        stage_base = self.stage_base
 
         self.model.eval()
         logits_all, labels_all = [], []
@@ -379,7 +393,7 @@ class WRMTrainer:
         # pretrain produces the reusable main model; specialize produces the
         # head-adapted model. Best weights take the fixed name so --init-from can
         # reference them; the final weights fall to the next free index.
-        stage_base = "main_model" if self.stage == "pretrain" else "specialized_model"
+        stage_base = self.stage_base
 
         time0 = perf_counter()
         epochs_ran = 0
@@ -410,6 +424,15 @@ class WRMTrainer:
         # a calibrator is only meaningful once the ignition head has trained
         if self.freeze != "heads":
             self.fit_calibration()
+
+        # the best-scoring weights are what a later run loads, and the calibrator
+        # only reads correctly against the weights it was fit on, so both travel
+        if self.export_s3:
+            export_to_s3(
+                MODEL_SAVE_DIR / f"{stage_base}.th",
+                MODEL_SAVE_DIR / f"{stage_base}.calib.json",
+                prefix=f"firefusion/{self.dataset_name}",
+            )
 
         # Do some plotting and fun visualizations!
         
@@ -447,33 +470,46 @@ class WRMTrainer:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train FireFusionNet on a built dataset")
-    parser.add_argument("--dataset", default="wa2000")
-    parser.add_argument("--profile", default="sanity", help="params.json profile")
+    parser.add_argument("--experiment", default="smoke", help="params.json experiment name")
+    parser.add_argument("--dataset", default=None,
+                        help="override the dataset the experiment names")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="override the experiment's seed")
     parser.add_argument("--stage", choices=["pretrain", "specialize"], default="pretrain",
                         help="pretrain the main model, or specialize the heads on top of it")
     parser.add_argument("--init-from", default=None,
                         help="checkpoint to warm-start from (bare name resolves under model/saved)")
     parser.add_argument("--freeze", choices=["none", "main", "heads"], default=None,
                         help="freeze the backbone ('main') or the decoder ('heads'); "
-                             "defaults to the profile's per-stage value")
+                             "defaults to the experiment's per-stage value")
     parser.add_argument("--alpha-ign", type=float, default=None, help="ignition loss weight")
     parser.add_argument("--alpha-cause", type=float, default=None, help="cause loss weight")
+    parser.add_argument("--export-s3", action="store_true",
+                        help="upload final weights + calibrator to AWS_S3_BUCKET when training ends")
     args = parser.parse_args()
 
-    set_global_seed(42)
     device, num_workers = get_device_config(maximum=2)
 
     """ Model Params """
     with open(f'{MODEL_DIR}/params.json') as file:
         data = json.load(file)
-        params = data[args.profile]
+        if args.experiment not in data:
+            raise SystemExit(
+                f"Unknown experiment '{args.experiment}'. Options: {sorted(data)}"
+            )
+        params = data[args.experiment]
 
     model_params        = params["model"]
     training_params     = params["training"]
 
-    # Resolve stage knobs: an explicit CLI flag wins, else the profile's
-    # per-stage default, else the profile's training default, else the hardcoded
-    # fallback. This keeps the plain `--dataset/--profile` invocation unchanged.
+    # an experiment names the dataset and seed it was defined against, so the
+    # experiment name alone reproduces the run; the flags are an escape hatch
+    dataset = args.dataset if args.dataset is not None else params["dataset"]
+    seed = args.seed if args.seed is not None else training_params["seed"]
+
+    # Resolve stage knobs: an explicit CLI flag wins, else the experiment's
+    # per-stage default, else the experiment's training default, else the hardcoded
+    # fallback. This keeps the plain `--dataset/--experiment` invocation unchanged.
     stage_defaults = training_params.get("stages", {}).get(args.stage, {})
 
     def _resolve(cli_val, key, fallback):
@@ -490,12 +526,15 @@ if __name__ == "__main__":
     wt = WRMTrainer(
         model_params, training_params,
         device, num_workers,
-        dataset_name = args.dataset,
+        dataset_name = dataset,
+        experiment = args.experiment,
+        seed = seed,
         mode = "train",
         stage = args.stage,
         init_from = args.init_from,
         freeze = freeze,
         alpha_ign = alpha_ign,
         alpha_cause = alpha_cause,
+        export_s3 = args.export_s3,
         debug = False
     )
