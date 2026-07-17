@@ -1,5 +1,22 @@
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+
+def group_norm(channels: int, max_groups: int = 32) -> nn.GroupNorm:
+    """ 
+    Normalizer for the encoder, sized to the largest group count that divides `channels`.
+
+    GroupNorm normalizes each sample independently and keeps no running
+    statistics. BatchNorm's running mean/var would instead be an average over
+    whatever extents were sampled during training, so training on crops drawn
+    from one part of the domain would bake that region's statistics into the
+    normalizer and apply them to every cell at full-domain inference.
+    """
+    return nn.GroupNorm(math.gcd(channels, max_groups), channels)
 
 
 # -------------------------------------------------------------------------------------------
@@ -10,9 +27,9 @@ class ConvResidualBlock(nn.Module):
         if out_ch is None:
             out_ch = in_ch
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, padding=padding, stride=stride, bias=False)
-        self.bn1   = nn.BatchNorm2d(out_ch)
+        self.norm1 = group_norm(out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=kernel_size, padding=padding, stride=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(out_ch)
+        self.norm2 = group_norm(out_ch)
         self.dropout = nn.Dropout(p=dropout)
         self.relu = nn.ReLU(inplace=True)
 
@@ -21,7 +38,7 @@ class ConvResidualBlock(nn.Module):
         self.downsample = (
             nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_ch),
+                group_norm(out_ch),
             )
             if stride != 1 or (in_ch != out_ch)
             else None
@@ -29,9 +46,9 @@ class ConvResidualBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
-        out = self.bn1(self.conv1(x))
+        out = self.norm1(self.conv1(x))
         out = self.relu(out)
-        out = self.bn2(self.conv2(out))
+        out = self.norm2(self.conv2(out))
         out = self.dropout(out)
 
         if self.downsample is not None:
@@ -61,7 +78,7 @@ class SpatialEncoder(nn.Module):
         # Large kernel early to capture broader patterns, max pool down to kernel_size=3
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, self.base_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(self.base_ch),
+            group_norm(self.base_ch),
             nn.ReLU(inplace=True)
         )
 
@@ -142,7 +159,9 @@ class WindowedSpatialAttention(nn.Module):
         # residual connection for better grad flow
         x_w = x_windows
         x_norm = self.norm(x_windows)
-        out, _ = self.window_attn(x_norm, x_norm, x_norm)  # (num_windows, tokens, C) -- Self-attention within each window
+        # need_weights=False keeps the attention matrix unmaterialized 
+        # ++ lets torch dispatch its fused kernels; the weights are discarded regardless
+        out, _ = self.window_attn(x_norm, x_norm, x_norm, need_weights=False)  # (num_windows, tokens, C) -- Self-attention within each window
         out = self.proj(out)
         out = out + x_w
 
@@ -159,31 +178,41 @@ class WindowedSpatialAttention(nn.Module):
 class ChannelMixingAttention(nn.Module):
     """
     Multi-Head Attention over CHANNELS, for fixed (B, T, H', W')
-    
+
     Shape: (B, T, embed_dim, H', W') --> (B, T, embed_dim, H', W') (no change)
     Steps:
-        - Projects channel dimes (embed_dim) -> d_model
+        - Tokenizes each channel into a d_model vector (value scale + identity)
         - Applies MH self-attention over channels
         - Applies MLP
-        - Projects back to embed_dim
+        - Projects back to a scalar per channel
+
+    Each (b, t, h', w') location is an independent attention problem, so the
+    N = B*T*H'*W' locations are processed in chunks: this block lifts every
+    channel to a d_model vector and is therefore d_model times wider than the
+    residual stream around it, which otherwise sets the memory ceiling for the
+    whole network. Chunking bounds that peak without altering the result.
     """
-    def __init__(self, num_channels, d_model, num_heads, mlp_ratio, dropout):
+    def __init__(self, num_channels, d_model, num_heads, mlp_ratio, dropout, chunk_size=4096):
         super().__init__()
         self.num_channels = num_channels
         self.d_model = d_model
+        self.num_heads = num_heads
+        self.chunk_size = chunk_size
+        self.dropout_p = dropout
 
-        
-        self.in_proj = nn.Linear(1, d_model) # embed_dim -> d_model
+        # Per-channel tokenizer: h[n, c, :] = x[n, c] * value_scale[c] + channel_embed[c].
+        # A shared Linear(1, d_model) would map every channel through one vector,
+        # leaving tokens without channel identity -- attention is permutation
+        # equivariant, so two channels holding the same value would be
+        # indistinguishable and no feature-pair interaction could be learned.
+        self.value_scale = nn.Parameter(torch.randn(num_channels, d_model) * 0.02)
+        self.channel_embed = nn.Parameter(torch.randn(num_channels, d_model) * 0.02)
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.attn_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, 1)
 
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            batch_first=True,
-            dropout=dropout,
-        )
-
         hidden_dim = int(d_model * mlp_ratio)
         self.norm2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
@@ -194,46 +223,58 @@ class ChannelMixingAttention(nn.Module):
             nn.Dropout(dropout),
         )
 
+    def _tokenize(self, x_chunk: torch.Tensor) -> torch.Tensor:
+        # (n, embed_dim) -> (n, embed_dim, d_model)
+        return x_chunk.unsqueeze(-1) * self.value_scale + self.channel_embed
+
+    def _mix(self, h: torch.Tensor) -> torch.Tensor:
+        # (n, embed_dim, d_model) -> (n, embed_dim, d_model)
+        n, C, D = h.shape
+        h_norm = self.norm1(h)
+
+        qkv = self.qkv(h_norm).view(n, C, 3, self.num_heads, D // self.num_heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)
+        # scaled_dot_product_attention keeps the (C, C) attention matrix out of
+        # memory; nn.MultiheadAttention materializes it whenever weights are
+        # requested, which is the default even when they are discarded
+        attn = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.dropout_p if self.training else 0.0
+        )
+        h = h + self.attn_proj(attn.transpose(1, 2).reshape(n, C, D))
+        return h + self.mlp(self.norm2(h))
+
+    def _block(self, x_chunk: torch.Tensor) -> torch.Tensor:
+        return self.out_proj(self._mix(self._tokenize(x_chunk))).squeeze(-1)
+
     def forward(self, x: torch.Tensor):
         # x: (B, T, embed_dim, H', W')
         B, T, embed_dim, Hp, Wp = x.shape
         assert embed_dim == self.num_channels, "ChannelMixBlock: num_channels doesn't match incoming embed_dim"
 
         # Move to (B*T*H'*W', embed_dim) to operate per spatial-temporal location
-        x_perm = x.permute(0, 1, 3, 4, 2).contiguous()      # (B, T, H', W', embed_dim)
-        x_flat = x_perm.view(B*T*Hp*Wp, embed_dim)          # (N, embed_dim)
+        x_flat = x.permute(0, 1, 3, 4, 2).reshape(B*T*Hp*Wp, embed_dim)
 
-        # Add a dummy feature dim for per-channel projection: (N, embed_dim, 1)
-        x_feat = x_flat.unsqueeze(-1)                       # (N, embed_dim, 1)
-
-        # Project to d_model
-        h = self.in_proj(x_feat)                            # (N, embed_dim, d_model)
-
-        # Attention over channels
-        # # sequence len = embed_dim, embed_dim = d_model
-        h_norm = self.norm1(h)
-        attn_out, _ = self.attn(h_norm, h_norm, h_norm)     # (N, embed_dim, d_model)
-        h = h + attn_out                                    # residual
-
-        # MLP
-        h_norm2 = self.norm2(h)
-        h_ffn = self.mlp(h_norm2)                           # (N, embed_dim, d_model)
-        h = h + h_ffn                                       # residual
-
-        # Project back to scalar per channel
-        out_feat = self.out_proj(h)                         # (N, embed_dim, 1)
-        out_flat = out_feat.squeeze(-1)                     # (N, embed_dim)
+        recompute = self.training and torch.is_grad_enabled()
+        outs = []
+        for i in range(0, x_flat.shape[0], self.chunk_size):
+            x_chunk = x_flat[i:i + self.chunk_size]
+            # recomputing each chunk in backward keeps the widened tokens from
+            # being retained for every chunk at once
+            outs.append(
+                checkpoint(self._block, x_chunk, use_reentrant=False)
+                if recompute else self._block(x_chunk)
+            )
+        out_flat = torch.cat(outs, dim=0)
 
         # Reshape back to (B, T, embed_dim, H', W')
-        out = out_flat.view(B, T, Hp, Wp, embed_dim).permute(0, 1, 4, 2, 3).contiguous()
-        return out
+        return out_flat.view(B, T, Hp, Wp, embed_dim).permute(0, 1, 4, 2, 3).contiguous()
 
 # -------------------------------------------------------------------------------------------
 # -------------------------------------------------------------------------------------------
 
 class TemporalMixingAttention(nn.Module):
     """
-    Multi-Head Attention over TIME T, for fixed dims B, embed_dim, H', and W'
+    Multi-Head Attention over time T, for fixed dims B, embed_dim, H', and W'
     
     Shape: (B, T, embed_dim, H', W') --> (B, T, embed_dim, H', W')
     Steps:
@@ -269,7 +310,7 @@ class TemporalMixingAttention(nn.Module):
         # pre-norm: each sub-block normalizes its own input and leaves the
         # residual stream itself untouched, with a LayerNorm per sub-block
         x_norm = self.norm(x)
-        out_attn, _ = self.attn(x_norm, x_norm, x_norm)
+        out_attn, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
         x = x + out_attn
 
         out_ffn = self.mlp(self.norm2(x))
@@ -289,16 +330,20 @@ class BiHeadDecoder(nn.Module):
     Convert spatiotemporal features into H x W risk map.
     Input:  (B, embed_dim, H', W') -- time dimension collapsed to last day
     Output: (B, 1, H, W) and (B, num_classes, H, W) per two heads
+
+    Upsampling inverts the encoder's single stride-2 stage rather than resizing
+    to a fixed grid, so the output tracks whatever extent was fed in. Every other
+    block is already shape-agnostic, which lets one model train on crops and
+    predict over the full domain.
     """
-    def __init__(self, embed_dim, out_size, n_cause_classes: int):
+    def __init__(self, embed_dim, n_cause_classes: int):
         super().__init__()
-        self.out_H, self.out_W = out_size
         self.n_cause_classes = n_cause_classes
 
         self.shared_head = nn.Sequential(
             nn.Conv2d(embed_dim, 64, 3, padding=1),
             nn.GELU(),
-            nn.Upsample(size=out_size, mode='bilinear')
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         )
 
         self.ignition_head = nn.Conv2d(64, 1, kernel_size=1)

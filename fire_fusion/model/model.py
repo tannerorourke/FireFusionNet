@@ -40,14 +40,14 @@ class FireFusionModel(nn.Module):
         tm_mlp_ratio=tm_params['mlp_ratio']
         tm_dropout  =tm_params['dropout']
 
-        out_size    =mp['out_size'];
+        cm_chunk    =cm_params.get('chunk_size', 4096)
         n_causes    =mp['n_cause_classes']
 
         self.encoder = SpatialEncoder(in_channels, embed_dim)
         self.ws_attn = WindowedSpatialAttention(embed_dim, num_heads=ws_heads, window_size=ws_win_size, dropout=ws_dropout)
-        self.cm_attn = ChannelMixingAttention(num_heads=cm_heads, num_channels=embed_dim, d_model=cm_d_model, mlp_ratio=cm_mlp_ratio, dropout=cm_dropout)
+        self.cm_attn = ChannelMixingAttention(num_heads=cm_heads, num_channels=embed_dim, d_model=cm_d_model, mlp_ratio=cm_mlp_ratio, dropout=cm_dropout, chunk_size=cm_chunk)
         self.tm_attn = TemporalMixingAttention(embed_dim, num_heads=tm_heads, mlp_ratio=tm_mlp_ratio, dropout=tm_dropout)
-        self.decoder = BiHeadDecoder(embed_dim, out_size, n_cause_classes=n_causes)
+        self.decoder = BiHeadDecoder(embed_dim, n_cause_classes=n_causes)
 
         # The backbone ("main") produces the shared representation; the decoder
         # ("heads") turns it into the ignition and cause maps. Grouping them here
@@ -91,13 +91,9 @@ class FireFusionModel(nn.Module):
 
     def forward(self, x: torch.Tensor):
         y = self.encoder(x)
-        # print(f"[WFM] Encoding complete...")
         y = self.ws_attn(y)
-        # print(f"[WFM] Windowed Spatial Attention complete...")
         y = self.cm_attn(y)
-        # print(f"[WFM] Channel Mixing Attention complete...")
         y = self.tm_attn(y)
-        # print(f"[WFM] Temporal Mixing Attention complete...")
 
         # Only decode the prediction from the last day
         y = y[:, -1]
