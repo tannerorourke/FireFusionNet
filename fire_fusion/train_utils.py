@@ -1,4 +1,5 @@
 import os
+import json
 import math
 import random
 from pathlib import Path
@@ -63,6 +64,61 @@ def save_model(
     torch.save(model.state_dict(), output_path)
 
     return str(output_path)
+
+
+def load_model(
+    model: torch.nn.Module,
+    path: str | os.PathLike,
+    map_location=None,
+    strict: bool = True,
+):
+    """ Restore weights written by save_model into an existing model.
+
+    A bare name (no directory component) is resolved against MODEL_SAVE_DIR,
+    mirroring save_model's output layout, so `load_model(m, "main_model.th")`
+    pairs with `save_model(m, name_base="main_model", overwrite=True)`.
+
+    strict=False tolerates a checkpoint that only covers part of the model
+    (e.g. a backbone loaded into a model with freshly initialized heads); the
+    returned value lists whatever keys were missing or unexpected.
+    """
+    p = Path(path)
+    if p.parent == Path("."):
+        p = MODEL_SAVE_DIR / p
+
+    state = torch.load(p, map_location=map_location)
+    return model.load_state_dict(state, strict=strict)
+
+
+def save_calibration(params: dict, name_base: str = "specialized_model") -> str:
+    """ Write a calibrator sidecar next to its `<name_base>.th` checkpoint.
+
+    The probabilities a checkpoint produces depend on both its weights and the
+    fitted calibration, so the two travel together under a shared name.
+    """
+    MODEL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = MODEL_SAVE_DIR / f"{name_base}.calib.json"
+    with open(output_path, "w") as f:
+        json.dump(params, f, indent=2)
+    return str(output_path)
+
+
+def load_calibration(name_base: str = "specialized_model") -> dict | None:
+    """ Load a calibrator sidecar by checkpoint name, or None if absent.
+
+    A bare `<name_base>` (no directory) resolves against MODEL_SAVE_DIR; a path
+    ending in `.calib.json` is read as given. Absent means "no fit available",
+    which the predictor answers with the analytic prior correction.
+    """
+    p = Path(name_base)
+    if p.suffix != ".json":
+        p = MODEL_SAVE_DIR / f"{p.name}.calib.json"
+    elif p.parent == Path("."):
+        p = MODEL_SAVE_DIR / p
+    if not p.exists():
+        return None
+    with open(p) as f:
+        return json.load(f)
 
 
 class WarmupCosineAnnealingLR:

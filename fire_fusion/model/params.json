@@ -54,7 +54,11 @@
           "min_lr": 1e-5,
           "base_lr": 3e-4,
           "weight_decay": 1e-4,
-          "grad_clip": 1.0
+          "grad_clip": 1.0,
+          "stages": {
+            "pretrain":   { "freeze": "none", "alpha_ign": 1.0, "alpha_cause": 0.0 },
+            "specialize": { "freeze": "main", "alpha_ign": 1.0, "alpha_cause": 1.0 }
+          }
       }
   },
   "optimal": {
@@ -83,7 +87,11 @@
           "min_lr": 1e-6,
           "base_lr": 5e-4,
           "weight_decay": 1e-4,
-          "grad_clip": 1.0
+          "grad_clip": 1.0,
+          "stages": {
+            "pretrain":   { "freeze": "none", "alpha_ign": 1.0, "alpha_cause": 0.0 },
+            "specialize": { "freeze": "main", "alpha_ign": 1.0, "alpha_cause": 1.0 }
+          }
       }
   }
 }

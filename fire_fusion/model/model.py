@@ -49,6 +49,46 @@ class FireFusionModel(nn.Module):
         self.tm_attn = TemporalMixingAttention(embed_dim, num_heads=tm_heads, mlp_ratio=tm_mlp_ratio, dropout=tm_dropout)
         self.decoder = BiHeadDecoder(embed_dim, out_size, n_cause_classes=n_causes)
 
+        # The backbone ("main") produces the shared representation; the decoder
+        # ("heads") turns it into the ignition and cause maps. Grouping them here
+        # lets a training stage freeze one group and specialize the other.
+        self._main_modules = [self.encoder, self.ws_attn, self.cm_attn, self.tm_attn]
+        self._head_modules = [self.decoder]
+        self._frozen_main = False
+        self._frozen_heads = False
+
+    def set_frozen(self, freeze_main: bool = False, freeze_heads: bool = False):
+        """ Toggle gradient flow for the backbone and decoder groups.
+
+        A frozen group is also switched to eval so its dropout and any
+        normalization statistics stay fixed while the other group trains —
+        otherwise the "stable" representation a head specializes against would
+        still be perturbed stochastically each step.
+        """
+        self._frozen_main = freeze_main
+        self._frozen_heads = freeze_heads
+
+        for module in self._main_modules:
+            for p in module.parameters():
+                p.requires_grad = not freeze_main
+        for module in self._head_modules:
+            for p in module.parameters():
+                p.requires_grad = not freeze_heads
+
+        # re-assert train/eval so a freeze applied mid-run takes effect at once
+        self.train(self.training)
+        return self
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self._frozen_main:
+            for module in self._main_modules:
+                module.eval()
+        if self._frozen_heads:
+            for module in self._head_modules:
+                module.eval()
+        return self
+
     def forward(self, x: torch.Tensor):
         y = self.encoder(x)
         # print(f"[WFM] Encoding complete...")

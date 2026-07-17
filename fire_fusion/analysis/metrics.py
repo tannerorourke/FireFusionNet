@@ -1,4 +1,5 @@
 from typing import Dict, List, Literal, Optional, Tuple
+import math
 import torch
 import torch.nn as nn
 import numpy as np
@@ -7,6 +8,10 @@ class TemperatureScaler(nn.Module):
     """
     Temperature scaling: logit_scaled = logit / T
     T > 0; we optimize log_T for stability: T = exp(log_T).
+
+    A pure scale keeps the 0.5-crossing pinned at logit 0, so it cannot move a
+    decision boundary that training shifted with a class weight. For that case
+    use PlattScaler, whose intercept absorbs the shift.
     """
     def __init__(self):
         super().__init__()
@@ -15,6 +20,95 @@ class TemperatureScaler(nn.Module):
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
         temperature = torch.exp(self.log_temperature)
         return logits / temperature
+
+
+class PlattScaler(nn.Module):
+    """
+    Affine logit calibration: z_cal = a * z + b, then p = sigmoid(z_cal).
+
+    A single-logit head trained with BCEWithLogitsLoss(pos_weight=w) converges,
+    at the population optimum, to z = log(w) + logit(p_true): the class weight
+    lands as a constant additive offset of log(w) in logit space. The intercept
+    b is what cancels that offset; the slope a corrects any residual over- or
+    under-confidence. Initializing (a=1, b=-log(w)) starts the fit exactly on
+    the analytic prior correction, so an unfittable split still yields sane
+    probabilities.
+
+    a is carried as exp(log_a) to keep the map monotone, which leaves every
+    ranking score (ROC-AUC, PR-AUC) invariant under calibration.
+    """
+    def __init__(self, prior_pos_weight: float | None = None):
+        super().__init__()
+        b0 = -math.log(float(prior_pos_weight)) if prior_pos_weight else 0.0
+        self.log_a = nn.Parameter(torch.zeros(1))       # a = 1
+        self.b = nn.Parameter(torch.full((1,), b0))     # analytic prior offset
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        return torch.exp(self.log_a) * logits + self.b
+
+    def probs(self, logits: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.forward(logits))
+
+    @torch.enable_grad()
+    def fit(self, logits: torch.Tensor, labels: torch.Tensor, max_iter: int = 100):
+        """ Fit (a, b) by minimizing unweighted BCE on held-out cells.
+
+        Unweighted is the point: the reliability we want is P(fire | score), so
+        the fit must see the true class balance rather than the training-time
+        reweighting that caused the miscalibration.
+        """
+        z = logits.detach().flatten().float()
+        y = labels.detach().flatten().float()
+
+        opt = torch.optim.LBFGS(self.parameters(), lr=0.1, max_iter=max_iter)
+
+        def closure():
+            opt.zero_grad()
+            loss = nn.functional.binary_cross_entropy_with_logits(self.forward(z), y)
+            loss.backward()
+            return loss
+
+        opt.step(closure)
+        return self
+
+    def state(self) -> Dict[str, float]:
+        return {"a": float(torch.exp(self.log_a).item()), "b": float(self.b.item())}
+
+    def load_state(self, params: Dict[str, float]):
+        with torch.no_grad():
+            self.log_a.fill_(math.log(float(params["a"])))
+            self.b.fill_(float(params["b"]))
+        return self
+
+
+@torch.no_grad()
+def expected_calibration_error(
+    probs: torch.Tensor, labels: torch.Tensor, num_bins: int = 15
+) -> float:
+    """ Weighted gap between confidence and accuracy across equal-width bins.
+
+    ECE is the single scalar that says whether a probability means what it
+    claims: bin by predicted probability, and in each bin compare the mean
+    prediction to the observed frequency, weighted by bin population.
+    """
+    p = probs.detach().flatten().float()
+    y = labels.detach().flatten().float()
+    if p.numel() == 0:
+        return float("nan")
+
+    edges = torch.linspace(0.0, 1.0, num_bins + 1, device=p.device)
+    ece = torch.zeros((), device=p.device)
+    for i in range(num_bins):
+        lo, hi = edges[i], edges[i + 1]
+        # the last bin owns its right edge so p == 1.0 is counted
+        in_bin = (p > lo) & (p <= hi) if i > 0 else (p >= lo) & (p <= hi)
+        n = in_bin.sum()
+        if n == 0:
+            continue
+        conf = p[in_bin].mean()
+        acc = y[in_bin].mean()
+        ece += (n.float() / p.numel()) * (conf - acc).abs()
+    return float(ece.item())
 
 
 class Metric:

@@ -11,13 +11,15 @@ from time import perf_counter
 
 from .dataset.data_loader import init_data_loader
 from .model.model import FireFusionModel
-from .config.path_config import MODEL_DIR
+from .config.path_config import MODEL_DIR, PLOTS_DIR
 from .train_utils import (
-    estimate_model_size_mb, set_global_seed, get_device_config, 
-    save_model, WarmupCosineAnnealingLR
+    estimate_model_size_mb, set_global_seed, get_device_config,
+    save_model, load_model, save_calibration, WarmupCosineAnnealingLR
 )
-from .analysis.metrics import MetricsManager
-from .analysis.plots import plot_class_accuracy, plot_loss_curves, plot_rates_per_epoch
+from .analysis.metrics import MetricsManager, PlattScaler, expected_calibration_error
+from .analysis.plots import (
+    plot_class_accuracy, plot_loss_curves, plot_rates_per_epoch, reliability_diagram
+)
 
 
 
@@ -29,11 +31,21 @@ class WRMTrainer:
         num_workers: int = 0,
         dataset_name: str = "wa2000",
         mode: Literal['train', 'test'] = 'train',
+        stage: Literal['pretrain', 'specialize'] = 'pretrain',
+        init_from: str | None = None,
+        freeze: Literal['none', 'main', 'heads'] = 'none',
+        alpha_ign: float = 1.0,
+        alpha_cause: float = 1.0,
         debug: bool = False
     ):
         self.device = device;
         self.use_amp = bool(device.type == "cuda")
         self.debug = debug
+
+        self.stage = stage
+        self.freeze = freeze
+        self.alpha_ign = alpha_ign
+        self.alpha_cause = alpha_cause
 
         # fp16 gradients underflow well before the ignition loss does (pos_weight
         # is O(1e4)); the scaler keeps them representable and drops any step that
@@ -63,6 +75,22 @@ class WRMTrainer:
 
         self.model = FireFusionModel(in_channels, mp=model_params).to(self.device)
 
+        # Warm-start from a checkpointed main model, then freeze the requested
+        # group so the other group specializes against a fixed representation.
+        if init_from is not None:
+            load_model(self.model, init_from, map_location=self.device)
+            print(f"[WRMTrainer] initialized weights from {init_from}")
+
+        if freeze != "none":
+            self.model.set_frozen(
+                freeze_main=(freeze == "main"),
+                freeze_heads=(freeze == "heads"),
+            )
+        n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in self.model.parameters())
+        print(f"[WRMTrainer] stage={stage} freeze={freeze} "
+              f"alpha_ign={alpha_ign} alpha_cause={alpha_cause} "
+              f"trainable_params={n_train}/{n_total}")
 
         ep = training_params["epochs"]
         self.ep_warmup, self.ep_max, self.ep_early_stop = ep[0], ep[1], ep[2]
@@ -103,7 +131,7 @@ class WRMTrainer:
         # masks read 1 where the cell is usable, so this is an AND of the two
         ign_mask = (land_mask == 1) & (no_act_fire_mask == 1)
 
-        # cause is only defined where an ignition at t+1 carries a known cause
+        # cause is only defined where a predicted ignition carries a known cause
         cause_mask = (ign_golds == 1) & (cause_golds != -1) & ign_mask
 
         return ign_golds, cause_golds, ign_mask, cause_mask
@@ -117,10 +145,10 @@ class WRMTrainer:
         alpha_ign: float = 1.0,
         alpha_cause: float = 1.0
     ):
-        """ Compute BCELogitsLoss on ignition at time t + 1,
+        """ Compute BCELogitsLoss on a next-window ignition,
             as well as cross entropy loss on ignition TYPE given an ignition
         """
-        # === Ignition Loss: on ignition at t = t+1 ===============
+        # === Ignition Loss: ignition within the forward window ===============
         ign_logits_flat = ign_logits.squeeze(1)
         ign_targets = ign_golds.float()
         ign_loss = self.bcewl_loss(
@@ -196,7 +224,8 @@ class WRMTrainer:
 
                 tot_loss, ign_loss, cause_loss = self._compute_loss(
                     ign_logits, ign_golds, cause_logits, cause_golds,
-                    ign_mask, cause_mask
+                    ign_mask, cause_mask,
+                    alpha_ign=self.alpha_ign, alpha_cause=self.alpha_cause
                 )
 
             # Log total loss
@@ -222,7 +251,7 @@ class WRMTrainer:
             losses=np.array([ep_total_loss, ep_ign_loss, ep_cause_loss])
         )
 
-    def eval_epoch(self, calibration = False):
+    def eval_epoch(self):
         self.model.eval()
         ep_total_loss: float = 0.0
         ep_ign_loss: float = 0.0
@@ -241,7 +270,8 @@ class WRMTrainer:
 
                     tot_loss, ign_loss, cause_loss = self._compute_loss(
                         ign_logits, ign_golds, cause_logits, cause_golds,
-                        ign_mask, cause_mask
+                        ign_mask, cause_mask,
+                        alpha_ign=self.alpha_ign, alpha_cause=self.alpha_cause
                     )
 
                 # Log total loss for epoch
@@ -260,10 +290,77 @@ class WRMTrainer:
             np.array([ep_total_loss, ep_ign_loss, ep_cause_loss])
         )
 
+    def fit_calibration(self):
+        """ Fit a Platt calibrator on held-out cells so the ignition head's
+            logits read as probabilities, and persist it beside the checkpoint.
+
+            Scores are read on the same supervised-cell population as the loss
+            and metrics (ign_mask), over the eval split. That is the split model
+            selection also reads, so the reported ECE is mildly optimistic; a
+            dedicated calibration split would remove that.
+        """
+        stage_base = "main_model" if self.stage == "pretrain" else "specialized_model"
+
+        self.model.eval()
+        logits_all, labels_all = [], []
+        with torch.no_grad():
+            for features, golds, masks in tqdm(self.eval_loader, desc="Calibrating...", leave=False):
+                features = features.to(self.device)
+                golds = { k: v.to(self.device) for k, v in golds.items() }
+                masks = { k: v.to(self.device) for k, v in masks.items() }
+
+                ign_golds, _, ign_mask, _ = self._prepare_targets(golds, masks)
+                ign_logits, _ = self.model(features)      # (B, 1, H, W)
+                ign_logits = ign_logits.squeeze(1)        # (B, H, W)
+
+                logits_all.append(ign_logits[ign_mask].float().cpu())
+                labels_all.append(ign_golds[ign_mask].float().cpu())
+
+        logits = torch.cat(logits_all) if logits_all else torch.empty(0)
+        labels = torch.cat(labels_all) if labels_all else torch.empty(0)
+        n_cells = int(labels.numel())
+        n_pos = int(labels.sum().item())
+
+        pos_weight = float(self.ign_pos_weight.item())
+        scaler = PlattScaler(prior_pos_weight=pos_weight)
+
+        ece_before = expected_calibration_error(torch.sigmoid(logits), labels)
+
+        # a fit needs both classes present; with none, the analytic prior stands
+        if 0 < n_pos < n_cells:
+            scaler.fit(logits, labels)
+
+        probs = scaler.probs(logits)
+        ece_after = expected_calibration_error(probs, labels)
+
+        params = {
+            **scaler.state(),
+            "pos_weight": pos_weight,
+            "fit_split": "eval",
+            "n_cells": n_cells,
+            "n_pos": n_pos,
+            "ece_before": ece_before,
+            "ece_after": ece_after,
+        }
+        calib_path = save_calibration(params, name_base=stage_base)
+        print(f"[WRMTrainer] calibration a={params['a']:.4f} b={params['b']:.4f} "
+              f"ECE {ece_before:.4f} -> {ece_after:.4f}  (n_pos={n_pos}/{n_cells})")
+        print(f"Saved calibration >> {calib_path}")
+
+        if n_cells > 0:
+            PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+            reliability_diagram(
+                probs, labels, title=f"Reliability ({stage_base})",
+                save_path=str(PLOTS_DIR / f"reliability_{stage_base}.png"),
+            )
+        return params
+
     def train(self):
+        # only trainable params reach the optimizer, so a frozen group is not
+        # nudged by weight decay or momentum while the other group specializes
         self.optimizer = optim.AdamW(
-            self.model.parameters(), 
-            lr=self.base_lr, 
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=self.base_lr,
             weight_decay=self.weight_decay
         )
         self.scheduler = WarmupCosineAnnealingLR(
@@ -279,6 +376,11 @@ class WRMTrainer:
             f"- min lr: {self.min_lr}, base lr: {self.base_lr}, grad clip: {self.grad_clip}, weight decay: {self.weight_decay}\n",
         )
 
+        # pretrain produces the reusable main model; specialize produces the
+        # head-adapted model. Best weights take the fixed name so --init-from can
+        # reference them; the final weights fall to the next free index.
+        stage_base = "main_model" if self.stage == "pretrain" else "specialized_model"
+
         time0 = perf_counter()
         epochs_ran = 0
         for epoch in range (1, self.ep_max + 1):
@@ -290,7 +392,7 @@ class WRMTrainer:
 
             # kept under a fixed name so the best weights survive the epochs that follow
             if new_best:
-                best_path = save_model(self.model, name_base="wf_risk_model_best", overwrite=True)
+                best_path = save_model(self.model, name_base=stage_base, overwrite=True)
                 print(f"Saved best weights >> {best_path}\n")
 
             if self.mm.no_improve > self.ep_early_stop:
@@ -302,8 +404,12 @@ class WRMTrainer:
         print(f"Finished training in {elapsed_min:.0f} min {elapsed_sec:.0f} sec")
         print(f"Best score @epoch {self.mm.best['epoch']} >> score: {self.mm.best['score']:.5f}")
 
-        final_path = save_model(self.model)
+        final_path = save_model(self.model, name_base=stage_base)
         print(f"Saved final weights >> {final_path}")
+
+        # a calibrator is only meaningful once the ignition head has trained
+        if self.freeze != "heads":
+            self.fit_calibration()
 
         # Do some plotting and fun visualizations!
         
@@ -343,6 +449,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train FireFusionNet on a built dataset")
     parser.add_argument("--dataset", default="wa2000")
     parser.add_argument("--profile", default="sanity", help="params.json profile")
+    parser.add_argument("--stage", choices=["pretrain", "specialize"], default="pretrain",
+                        help="pretrain the main model, or specialize the heads on top of it")
+    parser.add_argument("--init-from", default=None,
+                        help="checkpoint to warm-start from (bare name resolves under model/saved)")
+    parser.add_argument("--freeze", choices=["none", "main", "heads"], default=None,
+                        help="freeze the backbone ('main') or the decoder ('heads'); "
+                             "defaults to the profile's per-stage value")
+    parser.add_argument("--alpha-ign", type=float, default=None, help="ignition loss weight")
+    parser.add_argument("--alpha-cause", type=float, default=None, help="cause loss weight")
     args = parser.parse_args()
 
     set_global_seed(42)
@@ -356,10 +471,31 @@ if __name__ == "__main__":
     model_params        = params["model"]
     training_params     = params["training"]
 
+    # Resolve stage knobs: an explicit CLI flag wins, else the profile's
+    # per-stage default, else the profile's training default, else the hardcoded
+    # fallback. This keeps the plain `--dataset/--profile` invocation unchanged.
+    stage_defaults = training_params.get("stages", {}).get(args.stage, {})
+
+    def _resolve(cli_val, key, fallback):
+        if cli_val is not None:
+            return cli_val
+        if key in stage_defaults:
+            return stage_defaults[key]
+        return training_params.get(key, fallback)
+
+    freeze      = _resolve(args.freeze, "freeze", "none")
+    alpha_ign   = _resolve(args.alpha_ign, "alpha_ign", 1.0)
+    alpha_cause = _resolve(args.alpha_cause, "alpha_cause", 1.0)
+
     wt = WRMTrainer(
         model_params, training_params,
         device, num_workers,
         dataset_name = args.dataset,
         mode = "train",
+        stage = args.stage,
+        init_from = args.init_from,
+        freeze = freeze,
+        alpha_ign = alpha_ign,
+        alpha_cause = alpha_cause,
         debug = False
     )
