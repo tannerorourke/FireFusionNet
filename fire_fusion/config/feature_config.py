@@ -13,6 +13,13 @@ CAUSAL_CLASSES = [
     "DEBRIS"
 ]
 
+# Ignition prediction horizon (days). A clear cell is a positive if it burns on
+# any of the next IGN_HORIZON_DAYS days; the cause label and its validity mask
+# read the same forward window. A 1-day horizon leaves the positive class too
+# sparse to supervise; a week keeps the target a short-range forecast while
+# giving the ignition and cause heads enough signal.
+IGN_HORIZON_DAYS = 7
+
 CAUSE_RAW_MAP = {
     "NATURAL_LIGHTNING": [
         "1", # 1, 1 - lightning
@@ -323,6 +330,18 @@ def base_feat_config():
                 ds_clip = (0.0, 1.0),
             )
         ],
+        "LIGHTNING": [
+            Feature(
+                name = "lightning_strikes",
+                # daily CG strike count per 0.1 deg tile, gridded nearest onto
+                # the master cells inside the processor
+                resampling = Resampling.nearest,
+                # the product already carries a value (>=1 or a true zero) for
+                # every day, so no temporal interpolation is applied
+                time_interp = None,
+                ds_norms = ["log1p", "z_score"],
+            )
+        ],
         "CENSUSROADS": [
             Feature(
                 name = "d_to_road",
@@ -381,6 +400,14 @@ def drv_feat_config() -> List[Feature]:
         Feature(expand_names = ["precip_2d", "precip_5d"],
             func = "build_precip_cum",
             inputs=["precip_mm"], drop_inputs = None,
+            ds_norms = ["log1p", "z_score"],
+        ),
+        # exponentially-decayed running sum of CG strikes: a holdover proxy for
+        # ignitions that smoulder for days after a strike. The same-day strike
+        # count is kept as a second channel rather than dropped.
+        Feature(name = "lightning_load",
+            func = "build_lightning_load",
+            inputs=["lightning_strikes"], drop_inputs = None,
             ds_norms = ["log1p", "z_score"],
         ),
         Feature(expand_names = ["wind_dir_ew", "wind_dir_ns"],

@@ -3,6 +3,10 @@ import pandas as pd
 import xarray as xr
 import numpy as np
 from scipy.ndimage import maximum_filter
+from scipy.signal import lfilter
+
+from fire_fusion.config.feature_config import IGN_HORIZON_DAYS
+
 
 class DerivedProcessor:
     """
@@ -24,17 +28,21 @@ class DerivedProcessor:
         return da.sel(time=slice(f"{y0}-01-01", f"{y1}-12-31"))
 
     # -- Labels -----------------------------------------------------------------------------------
-    def build_ignition_next(self, subds: xr.Dataset, name: str) -> xr.DataArray:
-        """ 1. Burning = burn label from modis, USFS occurence, or USFS perimeter
-            2. shift forward 1 day
-            3. Label = NO BURN @T=t >> BURN @T=t+1
+    def build_ignition_next(self, subds: xr.Dataset, name: str,
+                            horizon: int = IGN_HORIZON_DAYS) -> xr.DataArray:
+        """ 1. Burning = burn label from USFS occurence or USFS perimeter
+            2. Label = NO BURN @T=t and BURN on any of T=t+1 .. t+horizon
+            A cell already alight cannot be a fresh ignition, so the positive is
+            gated on the cell being clear today.
         """
         burning_t = (
-            (subds["usfs_burn_occ"].fillna(0) > 0) | 
+            (subds["usfs_burn_occ"].fillna(0) > 0) |
             (subds["usfs_perimeter"].fillna(0) > 0)
         )
-        burning_tp1 = burning_t.shift(time=-1, fill_value=0)
-        ign_next_label = ((burning_t == 0) & (burning_tp1 == 1)).astype("uint8")
+        future_burn = burning_t.shift(time=-1, fill_value=False)
+        for k in range(2, horizon + 1):
+            future_burn = future_burn | burning_t.shift(time=-k, fill_value=False)
+        ign_next_label = ((~burning_t) & future_burn).astype("uint8")
         ign_next_label.name = name
         return ign_next_label
     
@@ -84,33 +92,38 @@ class DerivedProcessor:
         burn_filter.name = name
         return burn_filter
 
-    def build_ign_next_cause(self, subds: xr.Dataset, name: str) -> xr.DataArray:
-        """ 1. One hot encode burn cause dim (fill = -1's)
-            2. shift forward 1 day
-            3. Next cause = cause @T=t+1 conditioned on ignition @T=t+1
+    def _first_future_cause(self, burn_cause_t: xr.DataArray, horizon: int) -> xr.DataArray:
+        """ Cause id (0..K-1, or -1 for none) of the earliest day carrying a valid
+            cause within T=t+1 .. t+horizon. Days are scanned nearest-first so the
+            closest caused ignition wins.
         """
-        burn_cause_t = subds["usfs_burn_cause"]
+        cause_t = burn_cause_t.argmax(dim="burn_cause")
+        cause_t = xr.where(burn_cause_t.sum(dim="burn_cause") > 0, cause_t, -1)
+
+        next_cause = cause_t.shift(time=-1, fill_value=-1)
+        for k in range(2, horizon + 1):
+            cause_tk = cause_t.shift(time=-k, fill_value=-1)
+            next_cause = xr.where(next_cause >= 0, next_cause, cause_tk)
+        return next_cause
+
+    def build_ign_next_cause(self, subds: xr.Dataset, name: str,
+                             horizon: int = IGN_HORIZON_DAYS) -> xr.DataArray:
+        """ Cause of the earliest caused ignition within the forward window,
+            conditioned on a positive ignition label at the same cell.
+        """
         ignition_next = subds["ign_next"]
-        
-        # one hot, fill, shift
-        cause_t_oh = burn_cause_t.argmax(dim="burn_cause")
-        cause_t_oh = xr.where(burn_cause_t.sum(dim="burn_cause") > 0, cause_t_oh, -1)
-        cause_tp1_oh = cause_t_oh.shift(time=-1, fill_value=-1)
-        
-        ign_next_cause: xr.DataArray = xr.where(ignition_next == 1, cause_tp1_oh, -1)
+        next_cause = self._first_future_cause(subds["usfs_burn_cause"], horizon)
+
+        ign_next_cause: xr.DataArray = xr.where(ignition_next == 1, next_cause, -1)
         ign_next_cause.name = name
         return ign_next_cause
-    
-    def build_valid_cause_mask(self, subds: xr.Dataset, name: str) -> xr.DataArray:
-        burn_cause_t = subds["usfs_burn_cause"]
-        
-        # one hot, fill, shift
-        cause_t_oh = burn_cause_t.argmax(dim="burn_cause")
-        cause_t_oh = xr.where(burn_cause_t.sum(dim="burn_cause") > 0, cause_t_oh, -1)
-        cause_tp1_oh = cause_t_oh.shift(time=-1, fill_value=-1)
-        
-        # !!! Mask = 1 everywhere we have a "valid cause" @t+1, 0 otherwise
-        valid_cause_mask: xr.DataArray = (cause_tp1_oh >= 0).astype("uint8")
+
+    def build_valid_cause_mask(self, subds: xr.Dataset, name: str,
+                               horizon: int = IGN_HORIZON_DAYS) -> xr.DataArray:
+        next_cause = self._first_future_cause(subds["usfs_burn_cause"], horizon)
+
+        # Mask = 1 wherever a valid cause lands anywhere in the forward window
+        valid_cause_mask: xr.DataArray = (next_cause >= 0).astype("uint8")
         valid_cause_mask.name = name
         return valid_cause_mask
     
@@ -174,6 +187,33 @@ class DerivedProcessor:
 
         return xr.Dataset({ names[0]: p2d, names[1]: p5d })
          
+    def build_lightning_load(self, subds: xr.Dataset, name: str, half_life: float = 4.0) -> xr.DataArray:
+        """ Exponentially-decayed running sum of daily CG strike counts:
+                load[t] = strikes[t] + alpha * load[t-1],  alpha = 0.5 ** (1/half_life)
+            A strike's contribution halves every `half_life` days, approximating
+            how long a lightning-lit fire can hold before it is discovered. The
+            recursion runs along the (contiguous) time axis per spatial block.
+        """
+        strikes = subds["lightning_strikes"].fillna(0.0).astype("float32")
+        alpha = float(0.5 ** (1.0 / half_life))
+
+        # the IIR recursion needs the full time series in one chunk; spatial
+        # chunks stay split so the filter parallelizes across them
+        if strikes.chunks is not None:
+            strikes = strikes.chunk({"time": -1})
+
+        def _decay(arr):
+            return lfilter([1.0], [1.0, -alpha], arr, axis=0).astype("float32")
+
+        load = xr.apply_ufunc(
+            _decay,
+            strikes,
+            dask="parallelized",
+            output_dtypes=[np.float32],
+        )
+        load.name = name
+        return load
+
     def build_wind_ew_ns(self, subds: xr.Dataset, names: List[str]) -> xr.Dataset:
         rads = xr.apply_ufunc(np.deg2rad, subds["wind_dir"], dask="allowed")
         val_ew = - xr.apply_ufunc(np.sin, rads, dask="allowed").astype("float32")

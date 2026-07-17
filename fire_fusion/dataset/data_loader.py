@@ -21,7 +21,7 @@ class FireDataset(Dataset):
     """ Yields spatiotemporal windows:
         - X: (T, C, H, W) float32, the model input window
         - labels/masks: (H, W) at the window's final day (the prediction target
-          is the transition into the following day)
+          is a fresh ignition within the forward horizon of that day)
     """
     def __init__(
         self,

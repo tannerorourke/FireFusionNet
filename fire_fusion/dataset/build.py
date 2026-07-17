@@ -37,6 +37,7 @@ from .processors.proc_derived_feats import DerivedProcessor
 from .processors.proc_gpw import GPW
 from .processors.proc_gridmet import GridMet
 from .processors.proc_landfire import Landfire
+from .processors.proc_lightning import Lightning
 from .processors.proc_modis import Modis
 from .processors.proc_nlcd import NLCD
 from .processors.proc_usfs import UsfsFire
@@ -50,6 +51,7 @@ PROC_CLASSES = {
     "GPW": GPW,
     "GRIDMET": GridMet,
     "LANDFIRE": Landfire,
+    "LIGHTNING": Lightning,
     "MODIS": Modis,
     "NLCD": NLCD,
 }

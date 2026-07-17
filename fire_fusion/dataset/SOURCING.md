@@ -102,6 +102,21 @@
 - [Docs](https://www.mrlc.gov/sites/default/files/docs/LSDS-2103%20Annual%20National%20Land%20Cover%20Database%20(NLCD)%20Collection%201%20Science%20Product%20User%20Guide%20-v1.1%202025_06_11.pdf)
 - Dewitz, J., 2023. [National Land Cover Database (NLCD) 2021 Products.](https://doi.org/10.5066/P9KZCM54)
 
+## NCEI SWDI — NLDN Lightning
+
+Daily cloud-to-ground flash counts per 0.1° tile, derived from Vaisala's National
+Lightning Detection Network and published by NOAA's National Centers for
+Environmental Information.
+
+- [Lightning Products overview](https://www.ncei.noaa.gov/products/lightning-products)
+- [SWDI documentation & web services](https://www.ncdc.noaa.gov/swdiws/)
+- [Bulk per-year CSV archive](https://www.ncei.noaa.gov/pub/data/swdi/database-csv/v2/) — files `nldn-tiles-YYYY.csv.gz`, 1986–present
+- **Schema:** `#ZDAY,CENTERLON,CENTERLAT,TOTAL_COUNT`
+  - **ZDAY:** UTC day, `YYYYMMDD`
+  - **CENTERLON / CENTERLAT:** 0.1° tile centroid (degrees)
+  - **TOTAL_COUNT:** CG strikes in the tile that day
+  - A tile-day is written only when ≥1 strike is detected → an absent tile-day is a true zero.
+
 ## gridMET
 
 - [.sh script generator](https://www.climatologylab.org/wget-gridmet.html)
