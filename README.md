@@ -70,8 +70,19 @@ $$
 
 Reported results are the mean over the two seeds per dataset. the seed pairs are otherwise identical configurations.
 
+## Setup
+
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). `uv sync` builds a
+Python 3.11 environment from `pyproject.toml`/`uv.lock`; the linux `torch` wheel
+carries CUDA 12.1, so a GPU host needs no extra CUDA setup. Prefix commands with
+`uv run` to execute them inside that environment.
+
+```bash
+uv sync
+```
+
 ## Commands
 
-- `python -m fire_fusion.dataset.build --[dataset]`: Run the data extraction pipeline.
-- `python -m fire_fusion.model.train --[experiment] --[dataset] --[seed] --[stage] --[init-from] --[freeze] --[alpha-ign] --[alpha-cause] --[export-s3]`: Train the ConvFormer model. Requires a built dataset under `data/processed`.
-- `python -m fire_fusion.model.predict --[experiment] --[dataset] --[checkpoint] --[calib] --[split] --[batches]`: Turn a trained checkpoint into per-cell ignition probabilities.
+- `uv run python -m fire_fusion.dataset.build --[dataset]`: Run the data extraction pipeline.
+- `uv run python -m fire_fusion.model.train --[experiment] --[dataset] --[seed] --[stage] --[init-from] --[freeze] --[alpha-ign] --[alpha-cause] --[export-s3]`: Train the ConvFormer model. Requires a built dataset under `data/processed`.
+- `uv run python -m fire_fusion.model.predict --[experiment] --[dataset] --[checkpoint] --[calib] --[split] --[batches]`: Turn a trained checkpoint into per-cell ignition probabilities.

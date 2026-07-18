@@ -1,0 +1,38 @@
+[project]
+name = "fire-fusion"
+version = "0.1.0"
+description = "Spatio-temporal ConvFormer for wildfire ignition & cause prediction over Washington State"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # versions track the conda stack the pipeline was developed against, so a
+    # cloud run reproduces local behavior rather than resolving to newer majors
+    "torch==2.2.2",
+    "numpy>=1.26,<1.27",
+    "pandas>=2.2,<2.3",
+    "scipy>=1.12,<1.13",
+    "scikit-learn",
+    "matplotlib",
+    "tqdm",
+    # geospatial: wheels bundle their own GDAL/PROJ/GEOS, so no system libs
+    "rasterio>=1.4.3,<1.5",
+    "rioxarray>=0.15,<0.16",
+    "xarray>=2024.3,<2024.4",
+    "geopandas>=0.14,<0.15",
+    "pyogrio",
+    "fiona",
+    "shapely>=2.0,<2.1",
+    "pyproj>=3.6,<3.7",
+    # array IO backends used implicitly by xarray (.nc reads, zarr splits)
+    "netcdf4",
+    "h5netcdf",
+    "zarr>=2,<3",
+    "numcodecs",
+    "dask",
+    "earthaccess",
+    "boto3",
+]
+
+[tool.uv]
+# The repo is run as modules (`python -m fire_fusion.<...>`), not installed as a
+# distribution, so uv provisions dependencies without building the package.
+package = false
