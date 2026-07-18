@@ -18,7 +18,7 @@ class UsdaWui(Processor):
         super().__init__(cfg, master_grid)
 
         self.st_abrev = 'WA'
-        self.layer_name = "CONUS_WUI_block_1990_2020_change"
+        self.layer_name = "CONUS_WUI_block_1990_2020_change_v4"
         self.years = (2000, 2010, 2020)
         self.data_cols = [
             'WUICLASS2000', 'WUICLASS2010', 'WUICLASS2020',
@@ -60,7 +60,7 @@ class UsdaWui(Processor):
         obj = gpd.read_file(fp, engine="pyogrio",
             layer=self.layer_name,
             bbox=bounding_box,
-            where=f"STATEABREV = '{self.st_abrev}'"
+            where=f"STATE = '{self.st_abrev}'"
         )
         # Ensure reprojected to model CRS for raster
         if obj.crs != self.mCRS:
@@ -121,7 +121,7 @@ class UsdaWui(Processor):
 
 
     def build_feature(self, f_config: Feature):
-        fp = USDA_DIR / "CONUS_WUI_1990_2020.gdb"
+        fp = USDA_DIR / "CONUS_WUI_block_1990_2020_change_v4.gdb"
 
         # Load and save on the first feature, so we can skip for the next
         if self.geo_block is None:
@@ -224,7 +224,7 @@ class UsdaWui(Processor):
 
 if __name__ == "__main__":
     import fiona
-    fiona.listlayers(USDA_DIR / "CONUS_WUI_1990_2020.gdb")
+    fiona.listlayers(USDA_DIR / "CONUS_WUI_block_1990_2020_change_v4.gdb")
     from fire_fusion.config.feature_config import base_feat_config
     from ..grid import create_coordinate_grid
     

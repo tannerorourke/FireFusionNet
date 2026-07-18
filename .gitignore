@@ -4,8 +4,8 @@ __pycache__/
 # Downloaded Data (~160gb)
 data/**
 
-# specific files
-build/
+# Build files
+logs
 *.zip
 *.gzip
 *.accdb
@@ -16,6 +16,7 @@ build/
 .ipynb_checkpoints
 
 # Environments
+
 .env
 .venv
 .vscode

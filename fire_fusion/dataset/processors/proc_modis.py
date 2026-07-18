@@ -23,7 +23,7 @@ class Modis(Processor):
         # Login is only required when granules must be fetched; cached-local
         # builds should not depend on network credentials
         try:
-            self.auth = earthaccess.login(strategy="netrc", persist=True)
+            self.auth = earthaccess.login(strategy="environment", persist=True)
         except Exception as e:
             self.auth = None
             print(f"[LAADS] Earthdata login unavailable ({e}); only locally cached granules can be used")

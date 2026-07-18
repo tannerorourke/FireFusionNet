@@ -18,9 +18,9 @@ class CensusRoads(Processor):
     def build_feature(self, f_config: Feature):
         # load roads, reproject, clip
         road_paths = [
-            CROADS_DIR / "tl_2012_Washington_prisecroads.shp",
-            CROADS_DIR / "tl_2012_Idaho_prisecroads.shp",
-            CROADS_DIR / "tl_2012_Oregon_prisecroads.shp"
+            CROADS_DIR / "tl_2012_WA_53_prisecroads.shp",
+            CROADS_DIR / "tl_2012_ID_16_prisecroads.shp",
+            CROADS_DIR / "tl_2012_OR_41_prisecroads.shp"
         ]
         roads = gpd.GeoDataFrame(
             pd.concat([gpd.read_file(p) for p in road_paths], ignore_index=True),

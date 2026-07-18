@@ -15,7 +15,7 @@
 
 ## USDA Wildlife-Urban-Interface (WUI)
 
-- [Download](https://www.fs.usda.gov/rds/archive/catalog/RDS-2015-0012-3)
+- [Download](https://www.fs.usda.gov/rds/archive/catalog/RDS-2015-0012-4)
 - [Metadata](https://www.fs.usda.gov/rds/archive/products/RDS-2015-0012-4/_metadata_RDS-2015-0012-4.html)
   - **WUIFLAG{year}:**
     - 0: non-WUI
@@ -53,7 +53,7 @@
 
 ## MODIS (NASA Satellites!)
 
-- [earthaccess API](https://earthaccess.readthedocs.io/en/latest/user-reference/api/api/#earthaccess.api.download)
+- [earthaccess API (Account + get token)](https://earthaccess.readthedocs.io/en/latest/)
 - [NASA Data Explorer](https://ladsweb.modaps.eosdis.nasa.gov/search/order/1/MYD11A1--61,MCD15A2H--61)
 - [MCD152AH](https://ladsweb.modaps.eosdis.nasa.gov/missions-and-measurements/products/MCD15A2H)
   - [File spec](https://ladsweb.modaps.eosdis.nasa.gov/filespec/MODIS/6/MCD15A2H)
