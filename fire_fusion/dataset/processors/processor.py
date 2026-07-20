@@ -57,8 +57,9 @@ class Processor:
                 # obj = obj.rio.write_crs(self.mCRS)
                 obj = obj.rio.write_crs(f"EPSG:{epsg}")
                 obj = obj.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=False)
-                return obj
-            
+                # CRS recovered from the attribute, so the array can take the
+                # clip below rather than reaching reprojection at native extent
+
         minx, miny = self.gridref.attrs['x_min'], self.gridref.attrs['y_min']
         maxx, maxy = self.gridref.attrs['x_max'], self.gridref.attrs['y_max']
         
