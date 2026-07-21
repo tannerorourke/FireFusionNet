@@ -206,7 +206,16 @@ class Modis(Processor):
                 arr = self._reproject_dataset_to_mgrid(arr, f_cfg.resampling)
 
                 ndvi = arr["250m 16 days NDVI"].astype('float32')
-                qa = arr["250m 16 days VI Quality"].fillna(0).astype("uint16")
+
+                # QA code 0 decodes as both "good quality" and "shallow ocean", so
+                # cells this granule never covered have to be tracked separately
+                # instead of being folded into the bitfield as zeros.
+                raw_qa = arr["250m 16 days VI Quality"]
+                qa_fill = raw_qa.rio.nodata
+                if qa_fill is None:
+                    qa_fill = raw_qa.attrs.get("_FillValue", 65535)
+                observed = raw_qa.notnull() & (raw_qa != qa_fill)
+                qa = raw_qa.fillna(0).astype("uint16")
 
                 fill_val = ndvi.rio.nodata
                 if fill_val is None:
@@ -224,7 +233,7 @@ class Modis(Processor):
                 is_deep_water   = ((qa >> 11) & 0b111).isin([0, 2, 5, 6, 7])
 
                 ndvi = ndvi.where(valid_viq & is_land) * 1.0e-4
-                water_mask = xr.where(valid_viq & is_deep_water, 1, 0).astype("uint8")
+                water_mask = xr.where(observed & valid_viq & is_deep_water, 1, 0).astype("uint8")
 
             ndvi = ndvi.expand_dims(time=[ts])
             year_data_ndvi.append(ndvi)

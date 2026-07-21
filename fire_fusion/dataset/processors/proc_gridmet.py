@@ -77,7 +77,7 @@ class GridMet(Processor):
 
 
         elif f_cfg.key in ["th", "vs", "pr", "fm100"]:
-            files = GRIDMET_DIR.glob(f"{f_cfg.key}*.nc")
+            files = GRIDMET_DIR.glob(f"{f_cfg.key}_*.nc")
 
             for i, fp in enumerate(sorted(files)):
                 year = fp.stem.split("_")[-1]

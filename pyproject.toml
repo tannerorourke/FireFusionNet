@@ -1,11 +1,9 @@
 [project]
 name = "fire-fusion"
-version = "0.1.0"
+version = "1.2.0"
 description = "Spatio-temporal ConvFormer for wildfire ignition & cause prediction over Washington State"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-    # versions track the conda stack the pipeline was developed against, so a
-    # cloud run reproduces local behavior rather than resolving to newer majors
     "torch==2.2.2",
     "numpy>=1.26,<1.27",
     "pandas>=2.2,<2.3",
@@ -13,7 +11,11 @@ dependencies = [
     "scikit-learn",
     "matplotlib",
     "tqdm",
-    # geospatial: wheels bundle their own GDAL/PROJ/GEOS, so no system libs
+    # geospatial: wheels bundle their own GDAL/PROJ/GEOS, so no system libs.
+    # The bundled GDAL carries HDF5 but not HDF4, so reading raw MODIS granules
+    # (HDF-EOS2) additionally needs `conda install -c conda-forge libgdal-hdf4`.
+    # That applies to building a dataset locally; consumers of a built cube --
+    # cloud training included -- read zarr and need nothing extra.
     "rasterio>=1.4.3,<1.5",
     "rioxarray>=0.15,<0.16",
     "xarray>=2024.3,<2024.4",

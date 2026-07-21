@@ -14,6 +14,7 @@
 import argparse
 import gc
 import json
+import os
 import shutil
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
@@ -43,6 +44,9 @@ from .processors.proc_nlcd import NLCD
 from .processors.proc_usfs import UsfsFire
 from .processors.proc_croads import CensusRoads
 from .processors.proc_usda import UsdaWui
+
+# Upper bound on dask threads while writing the split stores. Measured peak for
+SPLIT_WRITE_WORKERS = 4
 
 PROC_CLASSES = {
     "CENSUSROADS": CensusRoads,
@@ -388,6 +392,11 @@ class FeatureGrid:
             "x": int(np.ceil(nx / self.cfg.spatial_splits)),
         }
 
+        # Every in-flight chunk carries all channels, so peak memory scales with
+        # the worker count rather than the store size. Dask's default of one
+        # thread per core overruns a 16-core box well before the write finishes.
+        write_workers = min(SPLIT_WRITE_WORKERS, os.cpu_count() or SPLIT_WRITE_WORKERS)
+
         for split in ("train", "eval", "test"):
             y0, y1 = self.cfg.split_years(split)
             sub = out.sel(time=slice(f"{y0}-01-01", f"{y1}-12-31"))
@@ -403,7 +412,8 @@ class FeatureGrid:
             if path.exists():
                 shutil.rmtree(path)
             print(f"[FeatureGrid] writing {split}: {sub.sizes['time']} days -> {path}")
-            sub.to_zarr(path, mode="w")
+            with dask.config.set(scheduler="threads", num_workers=write_workers):
+                sub.to_zarr(path, mode="w")
 
         manifest = {
             "dataset": self.cfg.name,
