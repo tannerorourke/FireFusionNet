@@ -301,7 +301,12 @@ def base_feat_config():
                 # 0/1 is ordinal
                 resampling = Resampling.nearest,
                 # NO TIME INTERPOLATION, forward fill in proc_modis
-                ds_norms = ["z_score"],
+                # The ceiling value is a "never burned in the record" sentinel
+                # carrying ~96% of cells, not a measured duration. z-scoring a
+                # distribution that constant yields a tiny sigma and throws recent
+                # burns out past -10 sigma, so this stays bounded in [0, 1];
+                # log1p first keeps resolution on the recent months that matter.
+                ds_norms = ["log1p", "minmax"],
             ),
         ],
         

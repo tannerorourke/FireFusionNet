@@ -45,7 +45,9 @@ from .processors.proc_usfs import UsfsFire
 from .processors.proc_croads import CensusRoads
 from .processors.proc_usda import UsdaWui
 
-# Upper bound on dask threads while writing the split stores. Measured peak for
+# Upper bound on dask threads while writing the split stores. Every in-flight
+# chunk carries all channels, so peak memory scales with the worker count rather
+# than the store size; wa2000 measures ~10.5 GB at 4.
 SPLIT_WRITE_WORKERS = 4
 
 PROC_CLASSES = {
