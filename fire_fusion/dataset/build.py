@@ -23,8 +23,9 @@ import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
+from numcodecs import Blosc
 
-from .grid import create_coordinate_grid
+from .grid import create_coordinate_grid, season_time_index, supervised_mask
 from fire_fusion.config.dataset_config import (
     DATASET_CONFIGS, DatasetConfig, get_dataset_config
 )
@@ -49,6 +50,15 @@ from .processors.proc_usda import UsdaWui
 # chunk carries all channels, so peak memory scales with the worker count rather
 # than the store size; wa2000 measures ~10.5 GB at 4.
 SPLIT_WRITE_WORKERS = 4
+
+# zstd trades a little write throughput for ~25% smaller stores than lz4 at the
+# same level, with the byte shuffle doing most of the work on float32 planes.
+SPLIT_COMPRESSOR = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
+
+# Labels and masks are int8/uint8 and overwhelmingly zero, so they compress to
+# almost nothing and gain no locality from the spatial split that X needs. Full
+# spatial extent per chunk keeps the file count down.
+LABEL_TIME_CHUNK = 64
 
 PROC_CLASSES = {
     "CENSUSROADS": CensusRoads,
@@ -79,7 +89,16 @@ class FeatureGrid:
         print("labels: ", self.label_names)
         print("masks: ", self.mask_names)
 
-        self.time_index = pd.date_range(ds_cfg.start_date, ds_cfg.end_date, freq="D")
+        self.time_index = season_time_index(
+            ds_cfg.start_date, ds_cfg.end_date,
+            ds_cfg.season_months, ds_cfg.halo_lead_days, ds_cfg.halo_trail_days,
+        )
+        if ds_cfg.season_months is not None:
+            n_sup = int(supervised_mask(self.time_index, ds_cfg.season_months).sum())
+            print(
+                f"season: months {ds_cfg.season_months[0]}-{ds_cfg.season_months[1]}, "
+                f"{len(self.time_index)} days extracted, {n_sup} supervised"
+            )
         self.grid = create_coordinate_grid(
             self.time_index,
             ds_cfg.resolution,
@@ -135,6 +154,14 @@ class FeatureGrid:
             layer = layer.to_dataset(name=layer.name)
 
         layer = layer.drop_vars("spatial_ref", errors="ignore")
+
+        # Several processors return float64 only because xarray's .interp()
+        # promotes; X is assembled as float32, so the extra precision is
+        # discarded downstream regardless. Narrowing here halves the staging
+        # cube and the finalize working set.
+        for name, da in layer.items():
+            if da.dtype == np.float64:
+                layer[name] = da.astype("float32")
 
         for name, da in layer.items():
             self._check_grid_alignment(str(name), da)
@@ -203,12 +230,35 @@ class FeatureGrid:
         n_cause_classes = int(ds.sizes["burn_cause"])
 
         ds = self._apply_derived(ds)
+        # Halo days have served their purpose once the temporal derivations have
+        # run. Dropping them here rather than at write time keeps normalization
+        # statistics and the class balance describing exactly the days that ship.
+        ds = self._drop_halo(ds)
         # Normalize while missing cells are still NaN, so statistics only see
         # valid observations; the zero-fill afterwards lands on the post-norm mean
         ds, norm_stats = self._apply_normalize(ds)
         ds = self._fill_missing(ds)
         pos_weight = self._compute_pos_weight(ds)
         self._save_splits(ds, norm_stats, pos_weight, n_cause_classes)
+
+    def _drop_halo(self, ds: xr.Dataset) -> xr.Dataset:
+        """ Keep only supervised (in-season) days.
+
+            A staging cube built before seasonal windowing holds every day of the
+            record, which is a superset of any halo range, so this selects out of
+            either layout.
+        """
+        if self.cfg.season_months is None:
+            return ds
+
+        keep = supervised_mask(ds.indexes["time"], self.cfg.season_months)
+        n_before = ds.sizes["time"]
+        ds = ds.isel(time=np.flatnonzero(keep))
+        print(
+            f"[FeatureGrid] season window: {n_before} -> {ds.sizes['time']} days "
+            f"({ds.sizes['time'] / n_before:.1%} kept)"
+        )
+        return ds
 
     def _apply_derived(self, ds: xr.Dataset) -> xr.Dataset:
         print(f"[FeatureGrid] Deriving anti-arson techniques through feature derivation..")
@@ -387,12 +437,18 @@ class FeatureGrid:
             out[mname] = ds[mname].astype("uint8")
 
         ny, nx = self.grid.sizes["y"], self.grid.sizes["x"]
-        chunks = {
+        # `spatial_splits` rises with resolution to hold the per-chunk byte count
+        # near wa2000's measured ~92 MB, which is what makes SPLIT_WRITE_WORKERS
+        # a resolution-independent memory bound.
+        x_chunks = {
             "time": self.cfg.x_time_chunk,
             "channel": -1,
             "y": int(np.ceil(ny / self.cfg.spatial_splits)),
             "x": int(np.ceil(nx / self.cfg.spatial_splits)),
         }
+        label_chunks = {"time": LABEL_TIME_CHUNK, "y": -1, "x": -1}
+        flat_names = list(self.label_names) + list(self.mask_names)
+        split_days: Dict[str, int] = {}
 
         # Every in-flight chunk carries all channels, so peak memory scales with
         # the worker count rather than the store size. Dask's default of one
@@ -402,7 +458,9 @@ class FeatureGrid:
         for split in ("train", "eval", "test"):
             y0, y1 = self.cfg.split_years(split)
             sub = out.sel(time=slice(f"{y0}-01-01", f"{y1}-12-31"))
-            sub = sub.chunk({d: c for d, c in chunks.items() if d in sub.dims})
+            sub["X"] = sub["X"].chunk(x_chunks)
+            for n in flat_names:
+                sub[n] = sub[n].chunk(label_chunks)
 
             # zarr saves attrs as JSON; stale read-encodings clash with new chunks
             sub.attrs.clear()
@@ -410,12 +468,17 @@ class FeatureGrid:
                 v.attrs.clear()
                 v.encoding.clear()
 
+            encoding = {
+                str(n): {"compressor": SPLIT_COMPRESSOR} for n in sub.data_vars
+            }
+
             path = self.cfg.split_path(split)
             if path.exists():
                 shutil.rmtree(path)
             print(f"[FeatureGrid] writing {split}: {sub.sizes['time']} days -> {path}")
             with dask.config.set(scheduler="threads", num_workers=write_workers):
-                sub.to_zarr(path, mode="w")
+                sub.to_zarr(path, mode="w", encoding=encoding)
+            split_days[split] = int(sub.sizes["time"])
 
         manifest = {
             "dataset": self.cfg.name,
@@ -423,8 +486,18 @@ class FeatureGrid:
             "lat_bounds": list(self.cfg.lat_bounds),
             "lon_bounds": list(self.cfg.lon_bounds),
             "grid": {"height": ny, "width": nx},
-            "time": {"start": self.cfg.start_date, "end": self.cfg.end_date},
+            "time": {
+                "start": self.cfg.start_date,
+                "end": self.cfg.end_date,
+                # Days are contiguous within a season block but jump at the
+                # year boundary; a loader must not build a window across the gap
+                "season_months": (
+                    list(self.cfg.season_months) if self.cfg.season_months else None
+                ),
+                "contiguous": self.cfg.season_months is None,
+            },
             "splits": {s: list(self.cfg.split_years(s)) for s in ("train", "eval", "test")},
+            "split_days": split_days,
             "channels": feature_names,
             "in_channels": len(feature_names),
             "labels": self.label_names,

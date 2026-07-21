@@ -7,6 +7,10 @@ from scipy.signal import lfilter
 
 from fire_fusion.config.feature_config import IGN_HORIZON_DAYS
 
+# Target working size of one spatial block's full time series in the lightning
+# IIR. lfilter allocates an equal-sized output, so a task costs roughly double.
+LIGHTNING_BLOCK_BYTES = 256 * 1024 ** 2
+
 
 class DerivedProcessor:
     """
@@ -191,16 +195,29 @@ class DerivedProcessor:
         """ Exponentially-decayed running sum of daily CG strike counts:
                 load[t] = strikes[t] + alpha * load[t-1],  alpha = 0.5 ** (1/half_life)
             A strike's contribution halves every `half_life` days, approximating
-            how long a lightning-lit fire can hold before it is discovered. The
-            recursion runs along the (contiguous) time axis per spatial block.
+            how long a lightning-lit fire can hold before it is discovered.
+
+            The recursion runs along time only, so splitting y/x is exact. On a
+            seasonally windowed index the filter also carries state across the
+            year boundary; the pre-season halo is sized so that carry-over has
+            decayed below 0.1% by the first supervised day.
         """
         strikes = subds["lightning_strikes"].fillna(0.0).astype("float32")
         alpha = float(0.5 ** (1.0 / half_life))
 
-        # the IIR recursion needs the full time series in one chunk; spatial
-        # chunks stay split so the filter parallelizes across them
+        # The recursion needs each cell's full time series in one chunk. The
+        # staging cube chunks time and holds full spatial extent, so this is the
+        # exact opposite layout and a naive time rechunk collapses the array into
+        # a single block -- ~10 GB at 250m, before lfilter's equal-sized output.
+        # Blocking y/x keeps each task bounded regardless of grid size.
         if strikes.chunks is not None:
-            strikes = strikes.chunk({"time": -1})
+            nt = strikes.sizes["time"]
+            edge = max(1, int(np.sqrt(LIGHTNING_BLOCK_BYTES / (nt * 4))))
+            strikes = strikes.chunk({
+                "time": -1,
+                "y": min(strikes.sizes["y"], edge),
+                "x": min(strikes.sizes["x"], edge),
+            })
 
         def _decay(arr):
             return lfilter([1.0], [1.0, -alpha], arr, axis=0).astype("float32")

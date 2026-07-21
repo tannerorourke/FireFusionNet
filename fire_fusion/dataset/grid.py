@@ -5,6 +5,51 @@ import xarray as xr, rioxarray
 from pyproj import CRS, Transformer
 
 
+def season_time_index(
+    start_date: str,
+    end_date: str,
+    season_months=None,
+    halo_lead_days: int = 40,
+    halo_trail_days: int = 10,
+) -> pd.DatetimeIndex:
+    """
+    Days to extract. With `season_months` set, this is the union of one block
+    per year covering the season plus a halo on either side; without it, every
+    day between the bounds.
+
+    The halo exists so temporal derivations (decayed lightning load, rolling
+    precipitation, the forward ignition horizon) enter the supervised window
+    with real history behind them instead of restarting at zero. Halo days are
+    dropped again before the splits are written, so they are never supervised.
+    """
+    full = pd.date_range(start_date, end_date, freq="D")
+    if season_months is None:
+        return full
+
+    m0, m1 = season_months
+    lead = pd.Timedelta(days=halo_lead_days)
+    trail = pd.Timedelta(days=halo_trail_days)
+
+    keep = pd.DatetimeIndex([])
+    for year in sorted(full.year.unique()):
+        block_start = pd.Timestamp(year=year, month=m0, day=1) - lead
+        # month end without calendar arithmetic: first of the next month, minus a day
+        month_end = pd.Timestamp(year=year + (m1 // 12), month=(m1 % 12) + 1, day=1)
+        block_end = month_end - pd.Timedelta(days=1) + trail
+        keep = keep.union(full[(full >= block_start) & (full <= block_end)])
+
+    return keep
+
+
+def supervised_mask(time_index, season_months) -> np.ndarray:
+    """ Which days of an extraction index carry supervision (i.e. are not halo). """
+    if season_months is None:
+        return np.ones(len(time_index), dtype=bool)
+    m0, m1 = season_months
+    months = np.asarray(pd.DatetimeIndex(time_index).month)
+    return (months >= m0) & (months <= m1)
+
+
 def create_coordinate_grid(
     time_index,
     resolution: float,

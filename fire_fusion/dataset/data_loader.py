@@ -79,11 +79,25 @@ class FireDataset(Dataset):
         self.window_size = window_size
         self.window_stride = window_stride
         self.n_timesteps = self.ds.sizes["time"]
-        self.window_starts = np.arange(
+        starts = np.arange(
             0, max(self.n_timesteps - window_size + 1, 0),
             window_stride,
             dtype=int,
         )
+        # A seasonally windowed dataset jumps from one October to the next May,
+        # so consecutive positions are not always consecutive days. Windows are
+        # kept only where every step inside them is a single day; a window
+        # straddling the gap would present two fire seasons as one sequence.
+        if len(starts) and self.n_timesteps > 1:
+            days = np.asarray(self.ds.indexes["time"], dtype="datetime64[D]")
+            step = np.diff(days).astype(int)
+            block = np.concatenate([[0], np.cumsum(step != 1)])
+            keep = block[starts] == block[starts + window_size - 1]
+            n_dropped = int((~keep).sum())
+            if n_dropped:
+                print(f"dropped {n_dropped} window(s) spanning a season gap")
+            starts = starts[keep]
+        self.window_starts = starts
 
         # crop_size is the supervised extent; the sample read is that plus a halo
         # on every side, so a crop_size of 96 reads 128x128 and supervises the
