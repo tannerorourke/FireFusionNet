@@ -5,7 +5,7 @@ import xarray as xr
 import pandas as pd
 
 from .processor import Processor
-from ..build_utils import K_to_F, load_as_xarr
+from ..build_utils import K_to_F, load_as_xarr, release_memory
 from fire_fusion.config.feature_config import Feature
 from fire_fusion.config.path_config import GRIDMET_DIR
 
@@ -37,6 +37,11 @@ class GridMet(Processor):
     def build_feature(self, f_cfg: Feature) -> xr.Dataset:
         feature_by_yrs: List[xr.DataArray] = []
 
+        # Only years the master grid actually spans reach the output; the source
+        # archive reaches back to 2000, and reprojecting years that the later
+        # time-alignment discards is what pushed peak memory over the guard.
+        valid_years = {int(y) for y in self.gridref.attrs["years"]}
+
         if f_cfg.key in ["tmm", "rm"]: # read in pairs of two
             yr_groups = self.group_by_year(f_cfg.key)
 
@@ -49,19 +54,21 @@ class GridMet(Processor):
                 return fp
 
             for (year, files) in sorted(yr_groups.items()):
+                if int(year) not in valid_years:
+                    continue
                 if f_cfg.key == "tmm":
                     print(f"[gridMET] Creating temperature gradient with unorthodox methods for {year}..")
-                    vmin = load_as_xarr(_pick(files, "tmmn"), name=f_cfg.name, variable='air_temperature')
-                    vmax = load_as_xarr(_pick(files, "tmmx"), name=f_cfg.name, variable='air_temperature')
+                    vmin = load_as_xarr(_pick(files, "tmmn"), name=f_cfg.name, variable='air_temperature').astype("float32")
+                    vmax = load_as_xarr(_pick(files, "tmmx"), name=f_cfg.name, variable='air_temperature').astype("float32")
                 elif f_cfg.key == "rm":
                     print(f"[gridMET] Retrieving humidity data for {year}; atmosphere refusing to disclose exact moisture..")
-                    vmin = load_as_xarr(_pick(files, "rmin"), name=f_cfg.name, variable='relative_humidity')
-                    vmax = load_as_xarr(_pick(files, "rmax"), name=f_cfg.name, variable='relative_humidity')
+                    vmin = load_as_xarr(_pick(files, "rmin"), name=f_cfg.name, variable='relative_humidity').astype("float32")
+                    vmax = load_as_xarr(_pick(files, "rmax"), name=f_cfg.name, variable='relative_humidity').astype("float32")
 
                 arr_min = self._preclip_native_arr(vmin)
                 arr_max = self._preclip_native_arr(vmax)
-                arr_min = self._reproject_arr_to_mgrid(arr_min, f_cfg.resampling)
-                arr_max = self._reproject_arr_to_mgrid(arr_max, f_cfg.resampling)
+                arr_min = self._reproject_arr_to_mgrid(arr_min, f_cfg.resampling).astype("float32")
+                arr_max = self._reproject_arr_to_mgrid(arr_max, f_cfg.resampling).astype("float32")
                 print("post reproj bounds:", arr_min.rio.bounds())
                 print("post reproj finite:", int(np.isfinite(arr_min).sum()))
                 print("post reproj min/max:", arr_min.min().item(), arr_min.max().item())
@@ -71,9 +78,14 @@ class GridMet(Processor):
 
                 elif f_cfg.key == "rm":
                     arr = self._build_rel_humidity(arr_min, arr_max, f_cfg)
-                
+
                 arr = self._ensure_time_dim(arr, year)
                 feature_by_yrs.append(arr)
+
+                # the native CONUS reads are ~1.2 GB each in float32; drop them and
+                # reclaim before the next year rather than letting them accumulate
+                del vmin, vmax, arr_min, arr_max
+                release_memory()
 
 
         elif f_cfg.key in ["th", "vs", "pr", "fm100"]:
@@ -81,12 +93,14 @@ class GridMet(Processor):
 
             for i, fp in enumerate(sorted(files)):
                 year = fp.stem.split("_")[-1]
+                if int(year) not in valid_years:
+                    continue
 
                 if f_cfg.key == "th":
                     print(f"[gridMET] {year} Just broke wind. {' AGAIN' if i > 2 else ''}")
-                    raw = load_as_xarr(fp, name=f_cfg.name, variable='wind_from_direction')
+                    raw = load_as_xarr(fp, name=f_cfg.name, variable='wind_from_direction').astype("float32")
                     v = self._preclip_native_arr(raw)
-                    vals = self._reproject_arr_to_mgrid(v, f_cfg.resampling)
+                    vals = self._reproject_arr_to_mgrid(v, f_cfg.resampling).astype("float32")
                     arr = self._build_wind_dir(vals, f_cfg)
                     print("post reproj bounds:", arr.rio.bounds())
                     print("post reproj finite:", int(np.isfinite(arr).sum()))
@@ -94,10 +108,10 @@ class GridMet(Processor):
 
                 elif f_cfg.key == "vs":
                     print(f"[gridMET] Cranking {year} backyard wind tunnel to {i*36 + (i*8) % 3}mph")
-                    raw = load_as_xarr(fp, name=f_cfg.name, variable="wind_speed")
+                    raw = load_as_xarr(fp, name=f_cfg.name, variable="wind_speed").astype("float32")
 
                     v = self._preclip_native_arr(raw)
-                    vals = self._reproject_arr_to_mgrid(v, f_cfg.resampling)
+                    vals = self._reproject_arr_to_mgrid(v, f_cfg.resampling).astype("float32")
                     arr = self._build_wind_spd(vals, f_cfg)
                     print("post reproj bounds:", arr.rio.bounds())
                     print("post reproj finite:", int(np.isfinite(arr).sum()))
@@ -105,29 +119,37 @@ class GridMet(Processor):
 
                 elif f_cfg.key == "pr":
                     print(f"[gridMET] {year} Negotiating with the rainman")
-                    raw = load_as_xarr(fp, name=f_cfg.name, variable="precipitation_amount")
+                    raw = load_as_xarr(fp, name=f_cfg.name, variable="precipitation_amount").astype("float32")
                     v = self._preclip_native_arr(raw)
-                    vals = self._reproject_arr_to_mgrid(v, f_cfg.resampling)
+                    vals = self._reproject_arr_to_mgrid(v, f_cfg.resampling).astype("float32")
                     arr = self._build_precip_mm(vals, f_cfg)
                     print("post reproj bounds:", arr.rio.bounds())
                     print("post reproj finite:", int(np.isfinite(arr).sum()))
                     print("post reproj min/max:", arr.min().item(), arr.max().item())
-                
+
                 elif f_cfg.key == "fm100":
                     print(f"[gridMET] {year} Collecting fuel moisture from the dead veggies")
-                    raw = load_as_xarr(fp, name=f_cfg.name, variable="dead_fuel_moisture_100hr")
+                    raw = load_as_xarr(fp, name=f_cfg.name, variable="dead_fuel_moisture_100hr").astype("float32")
                     v = self._preclip_native_arr(raw)
-                    vals = self._reproject_arr_to_mgrid(v, f_cfg.resampling)
+                    vals = self._reproject_arr_to_mgrid(v, f_cfg.resampling).astype("float32")
                     arr = self._build_dead_fuel_moisture_pct(vals, f_cfg)
                     print("post reproj bounds:", arr.rio.bounds())
                     print("post reproj finite:", int(np.isfinite(arr).sum()))
                     print("post reproj min/max:", arr.min().item(), arr.max().item())
-                
+
                 arr = self._ensure_time_dim(arr, year)
                 feature_by_yrs.append(arr)
-                
-        
+
+                del raw, v, vals
+                release_memory()
+
+
         feature: xr.Dataset = xr.concat(feature_by_yrs, dim="time").to_dataset(name=f_cfg.name)
+
+        # the per-year arrays are now duplicated inside `feature`; drop the list
+        # before sortby so its copy doesn't stack on top of them
+        feature_by_yrs.clear()
+        release_memory()
 
         print(f"[GridMet] Finished building {f_cfg.name}.. dims -> {feature.dims}")
 

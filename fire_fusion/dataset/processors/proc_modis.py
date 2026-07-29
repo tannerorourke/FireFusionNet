@@ -13,7 +13,7 @@ from earthaccess import DataGranule
 
 from fire_fusion.config.feature_config import Feature
 from fire_fusion.config.path_config import MODIS_DIR
-from ..build_utils import load_as_xdataset
+from ..build_utils import load_as_xdataset, print_layer_stats, release_memory
 from .processor import Processor
 
 class Modis(Processor):
@@ -41,43 +41,67 @@ class Modis(Processor):
         # We only want tiles that overlay the Pacific Northwest, which covers the below h/v indices
         self.tiles = ["h08v04", "h08v05", "h09v04", "h09v05", "h10v04"]
         self.version = "061"
-        self.max_parallel_req = 4
+        # granule reprojection is the memory-dominant step; running years
+        # sequentially keeps a single year's native buffers in flight at a time.
+        # (GDAL's warp is largely GIL-bound, so parallel workers bought little
+        # speed while multiplying peak memory past the guard.)
+        self.max_parallel_req = 1
         
     
     def build_feature(self, f_cfg: Feature) -> xr.Dataset:
-        feature_by_yr = xr.Dataset()
-    
+        # NDVI/LAI are forward-filled to a full calendar year per source year;
+        # burns stay monthly and their history reaches back to 2000 for the
+        # months-since-last-burn recursion, so they are not season-trimmed here.
+        is_daily = f_cfg.key in ("MOD13Q1", "MCD15A2H")
+        master_days = pd.DatetimeIndex(self.gridref.attrs["time_index"])
+
+        parts: List[xr.Dataset] = []
         with ThreadPoolExecutor(max_workers=self.max_parallel_req) as executor:
             if f_cfg.key == "MOD13Q1":
                 print("[LAADS] Purchasing satellite to collect more vegetation data...")
                 requests = {
-                    executor.submit(self._fetch_ndvi, f_cfg, yr): yr 
+                    executor.submit(self._fetch_ndvi, f_cfg, yr): yr
                     for yr in self.gridref.attrs['years']
                 }
             elif f_cfg.key == "MCD15A2H":
                 print(f"[LAADS] Checking how big the leaves are")
                 requests = {
-                    executor.submit(self._fetch_lai, f_cfg, yr): yr 
+                    executor.submit(self._fetch_lai, f_cfg, yr): yr
                     for yr in self.gridref.attrs['years']
                 }
             elif f_cfg.key == "MCD64A1":
                 print(f"[LAADS] Staring at the shiny objects")
                 requests = {
-                    executor.submit(self._fetch_burns, f_cfg, yr): yr 
+                    executor.submit(self._fetch_burns, f_cfg, yr): yr
                     for yr in list(range(2000, 2020 + 1))
                 }
-            
+
             for req in as_completed(requests):
                 yr = requests[req]
                 try:
                     yr_ds = req.result()
                     if yr_ds is None:
                         continue
-                    feature_by_yr = xr.merge([ feature_by_yr, yr_ds ], join="outer")
+                    if is_daily:
+                        # keep only the days the (seasonal) master index will use,
+                        # so the accumulation carries a third fewer days; the later
+                        # time-alignment would select exactly these anyway
+                        tix = yr_ds.indexes["time"]
+                        yr_ds = yr_ds.isel(time=np.flatnonzero(tix.isin(master_days)))
+                    parts.append(yr_ds)
+                    release_memory()
 
                 except Exception as e:
                     print(f"[LAADS] Satellite tried to load data for {yr}, epic fail! --> {e}\n\n")
 
+        # one concat instead of an accumulating merge, which copied the growing
+        # result on every year
+        if not parts:
+            feature_by_yr = xr.Dataset()
+        else:
+            feature_by_yr = xr.concat(parts, dim="time")
+            parts.clear()
+            release_memory()
 
         ### -- compute months since last burn -- ###
         if f_cfg.key == "MCD64A1" and len(feature_by_yr.data_vars) > 0:
@@ -85,7 +109,7 @@ class Modis(Processor):
 
         # -----------------------------------------------------------------------
         return self._time_interpolate(
-            feature_by_yr.sortby("time"), 
+            feature_by_yr.sortby("time"),
             f_cfg.time_interp
         ).transpose("time", "y", "x", ...)
     
@@ -157,30 +181,14 @@ class Modis(Processor):
 
             lai = lai.expand_dims(time=[ts])
             year_data.append(lai)
+            release_memory()
 
         stacked = xr.concat(year_data, dim="time").sortby("time")
         stacked = stacked.groupby("time").max("time")
         stacked = stacked.to_dataset(name=f_cfg.name)
 
         for name, da in stacked.data_vars.items():
-            ff = da.where(np.isfinite(da))
-            total = da.size
-            finite = int(np.isfinite(da).sum())
-            frac_finite = finite / float(total) if total > 0 else 0.0
-            try:
-                f_min = float(ff.min(dim=ff.dims, skipna=True))
-                f_max = float(ff.max(dim=ff.dims, skipna=True))
-                f_mean = float(ff.mean(dim=ff.dims, skipna=True))
-                f_std = float(ff.std(dim=ff.dims, skipna=True))
-            except Exception as e:
-                print(f"  {name}: <error computing stats: {e}>")
-                continue
-            print(
-                f"  {name:25s} "
-                f"min={f_min:10.4f} max={f_max:10.4f} "
-                f"mean={f_mean:10.4f} std={f_std:10.4f} "
-                f"finite={finite:,}/{total:,} ({frac_finite:6.2%})"
-            )
+            print_layer_stats(name, da)
 
         return stacked
     
@@ -241,6 +249,10 @@ class Modis(Processor):
             water_mask = water_mask.expand_dims(time=[ts])
             year_data_water.append(water_mask)
 
+            # release the native 250 m granule + warp buffers before the next
+            # granule so glibc arenas don't accumulate across the ~90/year
+            release_memory()
+
         # stack tiles for each day returned
         stacked_ndvi = xr.concat(year_data_ndvi, dim="time").sortby("time").groupby("time").max("time")
         stacked_wmask = xr.concat(year_data_water, dim="time").sortby("time").groupby("time").max("time")
@@ -251,6 +263,11 @@ class Modis(Processor):
         full_days = pd.date_range(ys, ye, freq="D")
         stacked_ndvi = stacked_ndvi.resample(time="1D").ffill().reindex(time=full_days, method="ffill")
         stacked_wmask = stacked_wmask.resample(time="1D").ffill().reindex(time=full_days, method="ffill")
+        # reindex introduces NaN before the year's first composite and so upcasts
+        # the mask to float; those leading days are all pre-season and get
+        # trimmed, so 0-fill and keep it uint8 (a quarter of the memory in the
+        # accumulation and the cube)
+        stacked_wmask = stacked_wmask.fillna(0).astype("uint8")
 
         assert f_cfg.expand_names is not None, "expected f_cfg.expand_names"
 
@@ -260,24 +277,7 @@ class Modis(Processor):
         })
 
         for name, da in stacked.data_vars.items():
-            ff = da.where(np.isfinite(da))
-            total = da.size
-            finite = int(np.isfinite(da).sum())
-            frac_finite = finite / float(total) if total > 0 else 0.0
-            try:
-                f_min = float(ff.min(dim=ff.dims, skipna=True))
-                f_max = float(ff.max(dim=ff.dims, skipna=True))
-                f_mean = float(ff.mean(dim=ff.dims, skipna=True))
-                f_std = float(ff.std(dim=ff.dims, skipna=True))
-            except Exception as e:
-                print(f"  {name}: <error computing stats: {e}>")
-                continue
-            print(
-                f"  {name:25s} "
-                f"min={f_min:10.4f} max={f_max:10.4f} "
-                f"mean={f_mean:10.4f} std={f_std:10.4f} "
-                f"finite={finite:,}/{total:,} ({frac_finite:6.2%})"
-            )
+            print_layer_stats(name, da)
 
         return stacked
     
@@ -315,6 +315,7 @@ class Modis(Processor):
 
             burned_flag = burned_flag.expand_dims(time=[month_start])
             monthly_burn_flags.append(burned_flag)
+            release_memory()
 
         if len(monthly_burn_flags) == 0:
             return None
@@ -388,33 +389,18 @@ class Modis(Processor):
         clip_end   = pd.Timestamp(max(self.gridref.attrs['years']), 12, 31)
         months_since = months_since.sel(time=slice(clip_start, clip_end))
 
-        # Convert monthly to daily with forward fill; reindex extends past the
-        # last month start through the end of the record (resample stops there)
+        # Convert monthly to daily then land on the master index directly. This
+        # feature carries no time_interp, so it must already match the (possibly
+        # season-windowed) master days here; forward fill assigns each master day
+        # the most recent monthly value.
         months_since = months_since.resample(time="1D").ffill()
-        full_days = pd.date_range(clip_start, clip_end, freq="D")
-        months_since = months_since.reindex(time=full_days, method="ffill")
+        master_days = pd.DatetimeIndex(self.gridref.attrs["time_index"])
+        months_since = months_since.reindex(time=master_days, method="ffill")
         months_since.name = f_cfg.name
         months_since = months_since.to_dataset(name=f_cfg.name)
 
         for name, da in months_since.data_vars.items():
-            ff = da.where(np.isfinite(da))
-            total = da.size
-            finite = int(np.isfinite(da).sum())
-            frac_finite = finite / float(total) if total > 0 else 0.0
-            try:
-                f_min = float(ff.min(dim=ff.dims, skipna=True))
-                f_max = float(ff.max(dim=ff.dims, skipna=True))
-                f_mean = float(ff.mean(dim=ff.dims, skipna=True))
-                f_std = float(ff.std(dim=ff.dims, skipna=True))
-            except Exception as e:
-                print(f"  {name}: <error computing stats: {e}>")
-                continue
-            print(
-                f"  {name:25s} "
-                f"min={f_min:10.4f} max={f_max:10.4f} "
-                f"mean={f_mean:10.4f} std={f_std:10.4f} "
-                f"finite={finite:,}/{total:,} ({frac_finite:6.2%})"
-            )
+            print_layer_stats(name, da)
 
         return months_since
 

@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import xarray as xr
 from typing import List, Tuple
 from pyproj import Transformer
@@ -175,6 +176,25 @@ class Processor:
                 return source_ds
             # Ensure increasing order for interpolation
             feature_sorted = source_ds.sortby("time")
+
+            # When every target day already sits on a source day (daily sources
+            # sampled onto a subset calendar), interpolation only reproduces the
+            # source values. Select them instead: exact, and it skips the float64
+            # interp that would otherwise materialize the whole cube at once.
+            target = pd.DatetimeIndex(time_index)
+            src_times = feature_sorted.indexes["time"]
+            # Source already on the exact target index (e.g. season-trimmed
+            # upstream): return as-is rather than copying it via .sel.
+            if src_times.equals(target):
+                return feature_sorted
+            if target.isin(src_times).all():
+                selected = feature_sorted.sel(time=target)
+                for name, da in selected.data_vars.items():
+                    print("post-interp(select)", name,
+                        "finite:", int(np.isfinite(da).sum()),
+                        "min/max:", float(da.min()), float(da.max()))
+                return selected
+
             interp = feature_sorted.interp(time=time_index, method=interp_method)
 
             # interp() does not extrapolate; days outside the source's coverage

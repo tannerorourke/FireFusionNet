@@ -5,7 +5,7 @@ import pandas as pd
 
 from .processor import Processor
 from fire_fusion.config.feature_config import Feature
-from ..build_utils import load_as_xarr
+from ..build_utils import load_as_xarr, print_layer_stats
 from fire_fusion.config.path_config import LANDFIRE_DIR
 
 
@@ -50,24 +50,7 @@ class Landfire(Processor):
         feature_by_year = feature_by_year.transpose("time", "y", "x", ...)
 
         for name, da in feature_by_year.data_vars.items():
-            ff = da.where(np.isfinite(da))
-            total = da.size
-            finite = int(np.isfinite(da).sum())
-            frac_finite = finite / float(total) if total > 0 else 0.0
-            try:
-                f_min = float(ff.min(dim=ff.dims, skipna=True))
-                f_max = float(ff.max(dim=ff.dims, skipna=True))
-                f_mean = float(ff.mean(dim=ff.dims, skipna=True))
-                f_std = float(ff.std(dim=ff.dims, skipna=True))
-            except Exception as e:
-                print(f"  {name}: <error computing stats: {e}>")
-                continue
-            print(
-                f"  {name:25s} "
-                f"min={f_min:10.4f} max={f_max:10.4f} "
-                f"mean={f_mean:10.4f} std={f_std:10.4f} "
-                f"finite={finite:,}/{total:,} ({frac_finite:6.2%})"
-            )
+            print_layer_stats(name, da)
 
         return feature_by_year
 

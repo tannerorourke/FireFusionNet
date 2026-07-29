@@ -12,7 +12,6 @@
 # slice directly. A manifest.json records channel order, normalization
 # statistics, grid shape, and the ignition class balance.
 import argparse
-import gc
 import json
 import os
 import shutil
@@ -26,6 +25,7 @@ import xarray as xr
 from numcodecs import Blosc
 
 from .grid import create_coordinate_grid, season_time_index, supervised_mask
+from .build_utils import release_memory
 from fire_fusion.config.dataset_config import (
     DATASET_CONFIGS, DatasetConfig, get_dataset_config
 )
@@ -59,6 +59,18 @@ SPLIT_COMPRESSOR = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
 # almost nothing and gain no locality from the spatial split that X needs. Full
 # spatial extent per chunk keeps the file count down.
 LABEL_TIME_CHUNK = 64
+
+
+def _rss_gb() -> float:
+    """ Resident set size of this process, for extraction memory tracing. """
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024 / 1024
+    except OSError:
+        pass
+    return 0.0
 
 PROC_CLASSES = {
     "CENSUSROADS": CensusRoads,
@@ -139,10 +151,11 @@ class FeatureGrid:
                     self._write_layer(layer)
 
                 del layer
-                gc.collect()
+                release_memory()
+                print(f"[mem] after {pname}/{config.name}: RSS={_rss_gb():.2f} GB", flush=True)
 
             del processor
-            gc.collect()
+            release_memory()
 
         print(f"[FeatureGrid] staging cube written to {self.cfg.staging_path}")
 
@@ -203,13 +216,24 @@ class FeatureGrid:
 
     def _print_layer_stats(self, name: str, da: xr.DataArray) -> None:
         try:
-            ff = da.where(np.isfinite(da))
-            f_min = float(ff.min(skipna=True))
-            f_max = float(ff.max(skipna=True))
-            f_mean = float(ff.mean(skipna=True))
-            f_std = float(ff.std(skipna=True))
+            # skipna reductions ignore NaN in place; the old `where(isfinite)`
+            # first materialized a float64 copy of the whole layer, which at
+            # 4-D cause-grid scale (~2e9 cells) was ~16 GB and blew the guard.
             total = da.size
-            finite = int(np.isfinite(da).sum())
+            is_int = np.issubdtype(da.dtype, np.integer)
+            if is_int:
+                # integers carry no NaN/inf, so every cell is finite
+                finite = total
+                f_min = float(da.min())
+                f_max = float(da.max())
+                f_mean = float(da.mean())
+                f_std = float(da.std())
+            else:
+                finite = int(np.isfinite(da).sum())
+                f_min = float(da.min(skipna=True))
+                f_max = float(da.max(skipna=True))
+                f_mean = float(da.mean(skipna=True))
+                f_std = float(da.std(skipna=True))
             frac_finite = finite / float(total) if total > 0 else 0.0
             print(
                 f"  + {name:25s} "

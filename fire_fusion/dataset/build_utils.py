@@ -1,3 +1,5 @@
+import ctypes
+import gc
 from pathlib import Path
 from typing import Dict, List
 import warnings
@@ -6,6 +8,64 @@ import numpy as np
 import xarray as xr, rioxarray
 import rasterio
 from rasterio.errors import NotGeoreferencedWarning
+
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+except OSError:
+    _LIBC = None
+
+
+def rss_gb() -> float:
+    """ Resident set size of this process in GB, for memory tracing. """
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024 / 1024
+    except OSError:
+        pass
+    return 0.0
+
+
+def release_memory() -> None:
+    """ Collect Python garbage and hand freed arenas back to the OS.
+
+        The reproject/warp step allocates large short-lived native arrays; glibc
+        keeps those arenas after free(), so resident memory climbs across a
+        per-year extraction loop even though little is live. malloc_trim returns
+        them, keeping peak RSS flat.
+    """
+    gc.collect()
+    if _LIBC is not None:
+        _LIBC.malloc_trim(0)
+
+
+def print_layer_stats(name: str, da: xr.DataArray) -> None:
+    """ Print min/max/mean/std/finite for a layer without copying it.
+
+        `da.where(np.isfinite(da))` materializes a float64 copy of the whole
+        array (~8x an int8 layer); at 4-D cause-grid or daily-MODIS scale that
+        copy alone exceeds the memory guard. skipna reductions ignore NaN in
+        place, and integer layers carry no NaN at all.
+    """
+    try:
+        total = int(da.size)
+        if np.issubdtype(da.dtype, np.integer):
+            finite = total
+            f_min, f_max = float(da.min()), float(da.max())
+            f_mean, f_std = float(da.mean()), float(da.std())
+        else:
+            finite = int(np.isfinite(da).sum())
+            f_min, f_max = float(da.min(skipna=True)), float(da.max(skipna=True))
+            f_mean, f_std = float(da.mean(skipna=True)), float(da.std(skipna=True))
+        frac = finite / float(total) if total else 0.0
+        print(
+            f"  {name:25s} min={f_min:10.4f} max={f_max:10.4f} "
+            f"mean={f_mean:10.4f} std={f_std:10.4f} "
+            f"finite={finite:,}/{total:,} ({frac:6.2%})"
+        )
+    except Exception as e:
+        print(f"  {name} (stats print failed: {e})")
 
 
 def K_to_F(k):

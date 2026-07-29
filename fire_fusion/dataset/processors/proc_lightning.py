@@ -70,9 +70,11 @@ class Lightning(Processor):
 
         tiles = pd.concat(frames, ignore_index=True)
 
-        # UTC day string -> master time index position
+        # UTC day string -> master time index position. Membership, not a range
+        # test: a season-windowed master index has gaps inside [first, last], and
+        # a strike on a dropped day has no position to scatter into.
         dates = pd.to_datetime(tiles["ZDAY"], format="%Y%m%d").dt.floor("D")
-        in_window = (dates >= self.mt_ix[0]) & (dates <= self.mt_ix[-1])
+        in_window = dates.isin(self.mt_ix)
         tiles = tiles.loc[in_window]
         dates = dates.loc[in_window]
 
