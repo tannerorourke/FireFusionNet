@@ -205,6 +205,15 @@ class UsfsFire(Processor):
         half_life = f_cfg.kde_half_life_days if f_cfg.kde_half_life_days is not None else 365.0
         alpha = float(0.5 ** (1.0 / half_life))
 
+        # Decay by the real number of days between consecutive index entries, not
+        # one step per entry. On a seasonally windowed index the winter gap between
+        # one season and the next spans months; a per-entry decay would collapse it
+        # to a single step and carry a multi-year prior across almost undecayed,
+        # reviving the drift. Winters hold ~no ignitions, so nothing is lost.
+        times = pd.DatetimeIndex(fire_occurences.coords["time"].values)
+        step_days = np.diff(times.asi8) / (1e9 * 86400.0)   # ns between entries -> days
+        step_decay = (alpha ** step_days).astype("float32")  # length T-1
+
         for cause in fire_occurences.coords["burn_cause"].values:
             # uint8 view of the occurrence stack; only fire days are cast/smoothed
             occ_txy = fire_occurences.sel(burn_cause=cause).values
@@ -218,12 +227,13 @@ class UsfsFire(Processor):
                     occ_txy[t].astype("float32"), sigma=sigma_pixels, mode="constant"
                 )
 
-            # In-place IIR recursion load[t] = smoothed[t] + alpha * load[t-1].
-            # Exact along time and holds only one (y, x) accumulator, so peak
-            # memory is unchanged at any grid resolution.
+            # In-place IIR recursion load[t] = smoothed[t] + decay(dt) * load[t-1].
+            # Holds only one (y, x) accumulator, so peak memory is unchanged at
+            # any grid resolution or record length.
             acc = np.zeros(kde_txy.shape[1:], dtype="float32")
             for t in range(kde_txy.shape[0]):
-                acc *= alpha
+                if t > 0:
+                    acc *= step_decay[t - 1]
                 acc += kde_txy[t]
                 kde_txy[t] = acc
 

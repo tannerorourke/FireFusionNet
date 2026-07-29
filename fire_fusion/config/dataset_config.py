@@ -14,11 +14,12 @@ class DatasetConfig:
     resolution: float                      # meters per pixel
     lat_bounds: Tuple[float, float]
     lon_bounds: Tuple[float, float]
-    start_date: str = "2009-01-01"
+    # 2003 is the earliest fully clean season (MODIS LAI MCD15A2H) begins mid-2002)
+    start_date: str = "2003-01-01"
     end_date: str = "2020-12-31"
 
     # Split boundaries; normalization statistics come from the train years only
-    train_yrs: Tuple[int, int] = (2009, 2016)
+    train_yrs: Tuple[int, int] = (2003, 2016)
     eval_yrs: Tuple[int, int] = (2017, 2018)
     test_yrs: Tuple[int, int] = (2019, 2020)
 

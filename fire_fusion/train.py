@@ -485,7 +485,7 @@ class WRMTrainer:
                 PLOTS_DIR / f"losses_{stage_base}.png",
                 PLOTS_DIR / f"rates_{stage_base}.png",
                 RUNS_DIR / run_name,
-                prefix=f"firefusion/{self.dataset_name}",
+                prefix=f"runs/{self.dataset_name}/{run_name}",
             )
 
     def test(self):

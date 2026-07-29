@@ -79,14 +79,14 @@ def save_model(
 
 def export_to_b2(
     *paths: str | Path,
-    prefix: str = "firefusion",
+    prefix: str = "runs",
 ) -> bool:
     """ Upload finished run artifacts to Backblaze B2 under `<prefix>/...`.
 
     A file uploads to `<prefix>/<filename>`; a directory (e.g. a TensorBoard run)
-    uploads recursively, each file keyed by its path relative to the directory's
-    parent so the run folder is reconstructed under the prefix. This is what lets
-    a run be reconstructed after the cloud box is torn down.
+    uploads recursively, each file keyed by its path relative to the directory
+    root, so its contents land directly under the prefix. Callers pass a per-run
+    prefix, letting the whole run be reconstructed after the cloud box is torn down.
 
     Credentials come from the B2_* environment (see dataset.fetch_cloud). Reports
     and returns False rather than raising: this runs after the weights are already
@@ -104,7 +104,7 @@ def export_to_b2(
             if path.is_dir():
                 for f in sorted(path.rglob("*")):
                     if f.is_file():
-                        rel = f.relative_to(path.parent).as_posix()
+                        rel = f.relative_to(path).as_posix()
                         store.put_file(f, f"{prefix}/{rel}", overwrite=True)
             else:
                 store.put_file(path, f"{prefix}/{path.name}", overwrite=True)

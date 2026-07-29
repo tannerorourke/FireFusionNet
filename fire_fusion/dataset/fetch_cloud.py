@@ -9,11 +9,14 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 from ..config.path_config import (
-    RAW_DATA_DIR, LANDFIRE_DIR, NLCD_DIR, GPW_DIR, CROADS_DIR, USFS_DIR,
-    PRISM_DIR, AORC_DIR, MODIS_DIR, USDA_DIR, NCEI_SWDI_DIR,
+    RAW_DATA_DIR, PROCESSED_DATA_DIR, LANDFIRE_DIR, NLCD_DIR, GPW_DIR, CROADS_DIR,
+    USFS_DIR, PRISM_DIR, AORC_DIR, MODIS_DIR, USDA_DIR, NCEI_SWDI_DIR,
 )
 
+# B2 key namespaces. Local layout round-trips to the same paths: raw sources under
+# data/raw/<source>, built cubes under data/processed/<dataset>, runs under runs/.
 RAW_PREFIX = "raw"
+PROCESSED_PREFIX = "processed"
 
 # Source name -> local directory. The name doubles as the B2 key segment, and each
 # dir sits directly under RAW_DATA_DIR, so a push/pull round-trips to the same path.
@@ -93,21 +96,44 @@ def _resolve_sources(names: Optional[Iterable[str]]) -> Dict[str, Path]:
     return {n: RAW_SOURCES[n] for n in names}
 
 
+def _processed_datasets(names: Optional[Iterable[str]]) -> list:
+    if names:
+        return list(names)
+    # push with no explicit list -> every built cube on local disk; a pull needs
+    # explicit names since the local processed dir may not exist yet on a fresh node
+    if not PROCESSED_DATA_DIR.exists():
+        return []
+    return sorted(p.name for p in PROCESSED_DATA_DIR.iterdir() if p.is_dir())
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Sync raw source data between local disk and B2.")
+    ap = argparse.ArgumentParser(description="Sync source data and built cubes between local disk and B2.")
     ap.add_argument("action", choices=["push", "pull"])
+    ap.add_argument("--kind", choices=["raw", "processed"], default="raw",
+                    help="raw sources (data/raw) or built cubes (data/processed)")
     ap.add_argument("--sources", nargs="+", choices=sorted(RAW_SOURCES), default=None,
-                    help="subset of raw sources; default all")
+                    help="raw only: subset of sources; default all")
+    ap.add_argument("--datasets", nargs="+", default=None,
+                    help="processed only: dataset names; push defaults to all built locally")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
     store = B2Store()
-    for name, path in _resolve_sources(args.sources).items():
-        prefix = f"{RAW_PREFIX}/{name}"
-        if args.action == "push":
-            store.put_tree(path, prefix, args.overwrite)
-        else:
-            store.get_tree(prefix, RAW_DATA_DIR / name, args.overwrite)
+    if args.kind == "raw":
+        for name, path in _resolve_sources(args.sources).items():
+            prefix = f"{RAW_PREFIX}/{name}"
+            if args.action == "push":
+                store.put_tree(path, prefix, args.overwrite)
+            else:
+                store.get_tree(prefix, RAW_DATA_DIR / name, args.overwrite)
+    else:
+        for ds in _processed_datasets(args.datasets):
+            prefix = f"{PROCESSED_PREFIX}/{ds}"
+            local = PROCESSED_DATA_DIR / ds
+            if args.action == "push":
+                store.put_tree(local, prefix, args.overwrite)
+            else:
+                store.get_tree(prefix, local, args.overwrite)
 
 
 if __name__ == "__main__":
