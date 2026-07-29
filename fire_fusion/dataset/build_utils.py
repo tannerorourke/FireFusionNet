@@ -68,12 +68,12 @@ def print_layer_stats(name: str, da: xr.DataArray) -> None:
         print(f"  {name} (stats print failed: {e})")
 
 
-def K_to_F(k):
-    return (k * (9/5)) - 459.67
+def C_to_F(c):
+    return (c * (9 / 5)) + 32.0
 
 
 def F_to_K(f):
-    return (f + 459.67) * 5/9
+    return (f + 459.67) * 5 / 9
 
 
 def read_hdf_file(subdataset: str, var = None):
@@ -151,7 +151,7 @@ def load_as_xarr(
             print(f"[LOAD_AS_XARR] Failed to load tif '{file.stem}': ", e)
             return xr.DataArray()
 
-    # gridMET
+    # PRISM / AORC annual NetCDF
     elif suffix == ".nc":
         try:
             ds = xr.open_dataset(file, engine="netcdf4")

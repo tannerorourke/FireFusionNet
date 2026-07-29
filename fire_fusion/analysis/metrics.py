@@ -453,6 +453,11 @@ class MetricsManager:
         self.epoch = 1
         self.no_improve = 0
 
+        # Last epoch_forward's console log and its scalar breakdown, so a caller
+        # can mirror them (TensorBoard) without recomputing.
+        self.last_report: str = ""
+        self.last_scalars: Dict[str, float] = {}
+
     def _is_improvement(self, score: float) -> bool:
         if self.select_by == "pr_auc":
             # an epoch whose eval split carried no positives scores nan and
@@ -579,7 +584,7 @@ class MetricsManager:
         trn_total, trn_ign, trn_cause = trn_last[:3]
         val_total, val_ign, val_cause = val_last[:3]
 
-        print(
+        report = (
             f"[Epoch {self.epoch}]\n"
             f"Train >> mL (total): {trn_total:.4f}, "
             f"mL (ign): {trn_ign:.4f}, "
@@ -594,6 +599,18 @@ class MetricsManager:
             f"recall: {ign_scores['recall']:.4f}\n"
             f"         SCORE ({self.select_by}): {score:.5f}"
         )
+        print(report)
+
+        self.last_report = report
+        self.last_scalars = {
+            "loss/train_total": float(trn_total), "loss/train_ign": float(trn_ign),
+            "loss/train_cause": float(trn_cause),
+            "loss/eval_total": float(val_total), "loss/eval_ign": float(val_ign),
+            "loss/eval_cause": float(val_cause),
+            "ign/pr_auc": float(ign_scores["pr_auc"]), "ign/roc_auc": float(ign_scores["roc_auc"]),
+            "ign/f1": float(ign_scores["f1"]), "ign/recall": float(ign_scores["recall"]),
+            "score": float(score),
+        }
 
         new_best = False
         if self._is_improvement(score):

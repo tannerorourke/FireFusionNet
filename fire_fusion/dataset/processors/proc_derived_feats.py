@@ -11,6 +11,99 @@ from fire_fusion.config.feature_config import IGN_HORIZON_DAYS
 # IIR. lfilter allocates an equal-sized output, so a task costs roughly double.
 LIGHTNING_BLOCK_BYTES = 256 * 1024 ** 2
 
+# NFDRS 1978 dead fuel moisture (Bradshaw/Deeming, GTR INT-169; response factors
+# and boundary constants match the WIMS/FireFamilyPlus operational code). The
+# EMC branches and boundary terms are hard-wired to Fahrenheit, so temperature
+# inputs must arrive in F. Per-day response fractions already encode the
+# 24h/timelag ratio and are applied once per daily step.
+FM100_RESPONSE = 1.0 - 0.87 * np.exp(-0.24)    # 0.315634
+FM1000_RESPONSE = 1.0 - 0.82 * np.exp(-0.168)  # 0.306811
+FM1000_SEED = 30.0                              # operational spin-up default (%)
+# Full-time series working size of one fuel-moisture spatial block. The scan
+# holds several equal-sized arrays (boundaries + output) per task.
+FUEL_BLOCK_BYTES = 96 * 1024 ** 2
+
+
+def _emc(Tf: np.ndarray, H: np.ndarray) -> np.ndarray:
+    """ Equilibrium moisture content (% gravimetric) from temperature (F) and
+        relative humidity (%). Three humidity branches; the mid branch carries no
+        H*T cross term. Constants are the NFDRS operational values.
+    """
+    emc_low = 0.03229 + 0.281073 * H - 0.000578 * H * Tf
+    emc_mid = 2.22749 + 0.160107 * H - 0.014784 * Tf
+    emc_high = 21.0606 + 0.005565 * H * H - 0.00035 * H * Tf - 0.483199 * H
+    return np.where(H < 10.0, emc_low, np.where(H < 50.0, emc_mid, emc_high))
+
+
+def _pdur_hours(precip_mm: np.ndarray) -> np.ndarray:
+    """ Precipitation duration (hours) estimated from daily precip amount.
+        NFDRS ingests observed duration, not amount; with amount-only daily
+        records this steps duration with rainfall and caps at the 8h
+        state-of-weather reporting limit. This is a modeling choice, not an
+        NFDRS constant.
+    """
+    conds = [precip_mm <= 0.0, precip_mm < 2.5, precip_mm < 5.0, precip_mm < 10.0, precip_mm < 25.0]
+    vals = [0.0, 1.0, 2.0, 4.0, 6.0]
+    return np.select(conds, vals, default=8.0).astype("float32")
+
+
+def _fuel_boundaries(tmin_f, tmax_f, hmin, hmax, precip_mm):
+    """ Daily 100h and 1000h boundary conditions (%). EMCbar is the 1978
+        simple average of the hot-dry and cool-moist EMC endpoints; the wet
+        term differs between the two timelag classes.
+    """
+    emc_hot = _emc(tmax_f, hmin)    # hot, dry -> lowest moisture
+    emc_cool = _emc(tmin_f, hmax)   # cool, moist -> highest moisture
+    emcbar = 0.5 * (emc_hot + emc_cool)
+    pdur = _pdur_hours(precip_mm)
+    d100 = ((24.0 - pdur) * emcbar + pdur * (0.5 * pdur + 41.0)) / 24.0
+    d1000 = ((24.0 - pdur) * emcbar + pdur * (2.7 * pdur + 76.0)) / 24.0
+    return d100.astype("float32"), d1000.astype("float32")
+
+
+def _fm100_scan(tmin_f, tmax_f, hmin, hmax, precip_mm, reset):
+    """ 100h fuel moisture recursion along axis 0 (time). `reset` marks the first
+        day of each contiguous time block (year gaps in a seasonal index); the
+        recursion reseeds at the day-0 boundary there rather than carrying the
+        prior block's state across the gap. The 100h class forgets its seed
+        within ~2 weeks.
+    """
+    d100, _ = _fuel_boundaries(tmin_f, tmax_f, hmin, hmax, precip_mm)
+    out = np.empty_like(d100)
+    prev = None
+    for t in range(d100.shape[0]):
+        if prev is None or reset[t]:
+            cur = d100[t]
+        else:
+            cur = prev + (d100[t] - prev) * FM100_RESPONSE
+        out[t] = cur
+        prev = cur
+    return np.clip(out, 0.0, 60.0).astype("float32")
+
+
+def _fm1000_scan(tmin_f, tmax_f, hmin, hmax, precip_mm, reset):
+    """ 1000h fuel moisture recursion along axis 0. The driver is a 7-day running
+        mean of the 1000h boundary condition, so the class carries ~6 weeks of
+        memory; the running mean is held within a block and cleared at each
+        reset. Seeded at the operational 30% default.
+    """
+    _, d1000 = _fuel_boundaries(tmin_f, tmax_f, hmin, hmax, precip_mm)
+    out = np.empty_like(d1000)
+    prev = None
+    window: List[np.ndarray] = []
+    for t in range(d1000.shape[0]):
+        if prev is None or reset[t]:
+            prev = np.full_like(d1000[t], FM1000_SEED)
+            window = []
+        window.append(d1000[t])
+        if len(window) > 7:
+            window.pop(0)
+        dbar = sum(window) / len(window)
+        cur = prev + (dbar - prev) * FM1000_RESPONSE
+        out[t] = cur
+        prev = cur
+    return np.clip(out, 0.0, 60.0).astype("float32")
+
 
 class DerivedProcessor:
     """
@@ -190,6 +283,50 @@ class DerivedProcessor:
         p5d = subds['precip_mm'].rolling(time=5, min_periods=1, center=False).sum().fillna(0)
 
         return xr.Dataset({ names[0]: p2d, names[1]: p5d })
+
+    def build_dead_fuel_derived(self, subds: xr.Dataset, names: List[str]) -> xr.Dataset:
+        """ NFDRS 100h and 1000h dead fuel moisture (%). Inputs arrive in NFDRS
+            units -- temperature in F, humidity in %, precip in mm. EMCbar uses
+            the diurnal extremes: rel_humidity carries the daily-min (hot-dry)
+            branch, rh_max the daily-max (cool-moist) branch.
+
+            The recursions run along time only, so splitting y/x is exact; the
+            staging cube's time-chunked full-extent layout is rechunked to the
+            opposite (full time, blocked space) to bound each task.
+        """
+        tmin = subds["temp_min"].fillna(60.0).astype("float32")
+        tmax = subds["temp_max"].fillna(60.0).astype("float32")
+        hmin = subds["rel_humidity"].fillna(50.0).clip(0.0, 100.0).astype("float32")
+        hmax = subds["rh_max"].fillna(50.0).clip(0.0, 100.0).astype("float32")
+        precip = subds["precip_mm"].fillna(0.0).astype("float32")
+
+        # First day of each contiguous block. A seasonally windowed index carries
+        # year-to-year gaps; the recursions reseed there rather than carry the
+        # prior block's fuel state across the break.
+        t = pd.DatetimeIndex(tmin.indexes["time"])
+        gap = np.diff(t.values).astype("timedelta64[D]").astype("int64") != 1
+        reset = np.concatenate([[True], gap])
+
+        inputs = [tmin, tmax, hmin, hmax, precip]
+        if tmin.chunks is not None:
+            nt = tmin.sizes["time"]
+            edge = max(1, int(np.sqrt(FUEL_BLOCK_BYTES / (nt * 4))))
+            chunking = {"time": -1, "y": min(tmin.sizes["y"], edge), "x": min(tmin.sizes["x"], edge)}
+            inputs = [a.chunk(chunking) for a in inputs]
+
+        fm100 = xr.apply_ufunc(
+            _fm100_scan, *inputs,
+            kwargs={"reset": reset},
+            dask="parallelized",
+            output_dtypes=[np.float32],
+        )
+        fm1000 = xr.apply_ufunc(
+            _fm1000_scan, *inputs,
+            kwargs={"reset": reset},
+            dask="parallelized",
+            output_dtypes=[np.float32],
+        )
+        return xr.Dataset({ names[0]: fm100, names[1]: fm1000 })
          
     def build_lightning_load(self, subds: xr.Dataset, name: str, half_life: float = 4.0) -> xr.DataArray:
         """ Exponentially-decayed running sum of daily CG strike counts:

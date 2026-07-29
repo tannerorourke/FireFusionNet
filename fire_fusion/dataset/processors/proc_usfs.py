@@ -197,10 +197,14 @@ class UsfsFire(Processor):
 
         print(f"sigma pixels = {kde_radius} / {pixel_size_km} = {sigma_pixels}")
 
-        # Loop over burn causes, computing gaussian filter for each class.
-        # Each timestep's map only accumulates fires observed up to that day:
-        # smoothing is linear, so smoothing daily occurrences and cumsum-ing over
-        # time is identical to smoothing the running cumulative map at every day
+        # A fire's contribution to the local ignition prior halves every
+        # half_life days, so the map is an exponentially decayed running sum
+        # rather than a lifetime cumsum. Decay keeps the accumulator stationary,
+        # so a train-fit z_score stays calibrated on the later eval/test years;
+        # a raw cumsum drifts upward by construction and breaks that calibration.
+        half_life = f_cfg.kde_half_life_days if f_cfg.kde_half_life_days is not None else 365.0
+        alpha = float(0.5 ** (1.0 / half_life))
+
         for cause in fire_occurences.coords["burn_cause"].values:
             # uint8 view of the occurrence stack; only fire days are cast/smoothed
             occ_txy = fire_occurences.sel(burn_cause=cause).values
@@ -213,7 +217,15 @@ class UsfsFire(Processor):
                 kde_txy[t] = gaussian_filter(
                     occ_txy[t].astype("float32"), sigma=sigma_pixels, mode="constant"
                 )
-            np.cumsum(kde_txy, axis=0, out=kde_txy)
+
+            # In-place IIR recursion load[t] = smoothed[t] + alpha * load[t-1].
+            # Exact along time and holds only one (y, x) accumulator, so peak
+            # memory is unchanged at any grid resolution.
+            acc = np.zeros(kde_txy.shape[1:], dtype="float32")
+            for t in range(kde_txy.shape[0]):
+                acc *= alpha
+                acc += kde_txy[t]
+                kde_txy[t] = acc
 
             name = f"kde_{str(cause).lower()}"
             da_kde = xr.DataArray(

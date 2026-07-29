@@ -77,37 +77,40 @@ def save_model(
     return str(output_path)
 
 
-def export_to_s3(
-    *files: str | Path,
+def export_to_b2(
+    *paths: str | Path,
     prefix: str = "firefusion",
-    bucket: str | None = None,
-    region: str | None = None,
 ) -> bool:
-    """ Upload finished run artifacts to `s3://<bucket>/<prefix>/<filename>`.
+    """ Upload finished run artifacts to Backblaze B2 under `<prefix>/...`.
 
-    Bucket and region fall back to AWS_S3_BUCKET / AWS_REGION. Reports and
-    returns False rather than raising: this runs after the weights are already on
-    local disk, so a credentials or network problem should not take down an
+    A file uploads to `<prefix>/<filename>`; a directory (e.g. a TensorBoard run)
+    uploads recursively, each file keyed by its path relative to the directory's
+    parent so the run folder is reconstructed under the prefix. This is what lets
+    a run be reconstructed after the cloud box is torn down.
+
+    Credentials come from the B2_* environment (see dataset.fetch_cloud). Reports
+    and returns False rather than raising: this runs after the weights are already
+    on local disk, so a credentials or network problem should not take down an
     otherwise complete run.
     """
-    bucket = bucket or os.environ.get("AWS_S3_BUCKET")
-    if not bucket:
-        print("[export_to_s3] AWS_S3_BUCKET unset, skipping upload")
-        return False
-
     try:
-        import boto3
-        client = boto3.client("s3", region_name=region or os.environ.get("AWS_REGION") or None)
-        for f in files:
-            path = Path(f)
+        from .dataset.fetch_cloud import B2Store
+        store = B2Store()
+        for p in paths:
+            path = Path(p)
             if not path.exists():
-                print(f"[export_to_s3] {path.name} missing locally, skipping")
+                print(f"[export_to_b2] {path.name} missing locally, skipping")
                 continue
-            client.upload_file(str(path), bucket, f"{prefix}/{path.name}")
-            print(f"[export_to_s3] s3://{bucket}/{prefix}/{path.name}")
+            if path.is_dir():
+                for f in sorted(path.rglob("*")):
+                    if f.is_file():
+                        rel = f.relative_to(path.parent).as_posix()
+                        store.put_file(f, f"{prefix}/{rel}", overwrite=True)
+            else:
+                store.put_file(path, f"{prefix}/{path.name}", overwrite=True)
         return True
     except Exception as e:
-        print(f"[export_to_s3] upload failed ({type(e).__name__}): {e}")
+        print(f"[export_to_b2] upload failed ({type(e).__name__}): {e}")
         return False
 
 

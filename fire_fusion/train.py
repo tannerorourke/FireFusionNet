@@ -7,14 +7,15 @@ import json
 import numpy as np
 from typing import Literal, Dict
 from tqdm import tqdm
-from time import perf_counter
+from time import perf_counter, strftime
+from torch.utils.tensorboard.writer import SummaryWriter
 
 from .dataset.data_loader import init_data_loader
 from .model.model import FireFusionModel
-from .config.path_config import MODEL_DIR, MODEL_SAVE_DIR, PLOTS_DIR
+from .config.path_config import MODEL_DIR, MODEL_SAVE_DIR, PLOTS_DIR, RUNS_DIR
 from .train_utils import (
     estimate_model_size_mb, set_global_seed, get_device_config, checkpoint_name,
-    save_model, load_model, save_calibration, export_to_s3, WarmupCosineAnnealingLR
+    save_model, load_model, save_calibration, export_to_b2, WarmupCosineAnnealingLR
 )
 from .analysis.metrics import MetricsManager, PlattScaler, expected_calibration_error
 from .analysis.plots import (
@@ -38,7 +39,7 @@ class WRMTrainer:
         freeze: Literal['none', 'main', 'heads'] = 'none',
         alpha_ign: float = 1.0,
         alpha_cause: float = 1.0,
-        export_s3: bool = False,
+        export_b2: bool = False,
         debug: bool = False
     ):
         # seeded before anything draws: weight init, dropout, shuffling, and crop
@@ -52,7 +53,7 @@ class WRMTrainer:
 
         self.dataset_name = dataset_name
         self.experiment = experiment
-        self.export_s3 = export_s3
+        self.export_b2 = export_b2
         self.stage = stage
         self.stage_base = checkpoint_name(experiment, stage)
         self.freeze = freeze
@@ -395,6 +396,12 @@ class WRMTrainer:
         # reference them; the final weights fall to the next free index.
         stage_base = self.stage_base
 
+        # One TensorBoard run per (experiment, stage) invocation; the timestamp
+        # keeps reruns from writing into the same event stream.
+        run_name = f"{self.experiment}_{self.stage}_{strftime('%m%d-%H%M%S')}"
+        writer = SummaryWriter(log_dir=str(RUNS_DIR / run_name))
+        print(f"[WRMTrainer] tensorboard logdir >> {RUNS_DIR / run_name}")
+
         time0 = perf_counter()
         epochs_ran = 0
         for epoch in range (1, self.ep_max + 1):
@@ -404,6 +411,14 @@ class WRMTrainer:
             score, new_best, trn_last, val_last = self.mm.epoch_forward()
             epochs_ran += 1
 
+            # the console log and its scalar breakdown are collected in the
+            # metrics manager; mirror both to TensorBoard for live monitoring
+            for tag, val in self.mm.last_scalars.items():
+                writer.add_scalar(tag, val, epoch)
+            writer.add_scalar("lr", self.optimizer.param_groups[0]["lr"], epoch)
+            writer.add_text("epoch_report", self.mm.last_report, epoch)
+            writer.flush()
+
             # kept under a fixed name so the best weights survive the epochs that follow
             if new_best:
                 best_path = save_model(self.model, name_base=stage_base, overwrite=True)
@@ -412,6 +427,8 @@ class WRMTrainer:
             if self.mm.no_improve > self.ep_early_stop:
                 print(f"Stopped training for early stop")
                 break
+
+        writer.close()
 
         elapsed_min = (perf_counter() - time0) // 60
         elapsed_sec = (perf_counter() - time0) % 60
@@ -425,43 +442,51 @@ class WRMTrainer:
         if self.freeze != "heads":
             self.fit_calibration()
 
-        # the best-scoring weights are what a later run loads, and the calibrator
-        # only reads correctly against the weights it was fit on, so both travel
-        if self.export_s3:
-            export_to_s3(
-                MODEL_SAVE_DIR / f"{stage_base}.th",
-                MODEL_SAVE_DIR / f"{stage_base}.calib.json",
-                prefix=f"firefusion/{self.dataset_name}",
-            )
-
         # Do some plotting and fun visualizations!
-        
-
         trn_losses, val_losses = self.mm.get_history()
-
         trn_ignit_acc, trn_cause_acc = self.mm.trn_accuracies[0], self.mm.trn_accuracies[1]
         val_ignit_acc, val_cause_acc = self.mm.val_accuracies[0], self.mm.val_accuracies[1]
-
         val_ignit_cm = self.mm.val_cm[0]
         last_ign_cm, ign_rates, ign_cm_record = val_ignit_cm.get_history()
 
         epochs_axis = list(range(1, epochs_ran + 1))
         
         # Train vs. Eval
+        # every plot carries the run's stage_base so artifacts from different
+        # (experiment, stage) runs never overwrite one another in the shared dir
         plot_class_accuracy(
-            epochs_axis, 
-            val_ignit_acc, val_cause_acc, 
-            trn_ignit_acc, trn_cause_acc, 
-            save=True
+            epochs_axis,
+            val_ignit_acc, val_cause_acc,
+            trn_ignit_acc, trn_cause_acc,
+            save=True, save_path=str(PLOTS_DIR / f"class_accuracy_{stage_base}.png"),
         )
         plot_loss_curves(
-            epochs_axis, 
-            trn_losses, val_losses, 
-            save=True
+            epochs_axis,
+            trn_losses, val_losses,
+            save=True, save_path=str(PLOTS_DIR / f"losses_{stage_base}.png"),
         )
-        
+
         tpr, tnr, fpr, fnr = ign_rates
-        plot_rates_per_epoch(epochs_axis, ign_rates, save=True)
+        plot_rates_per_epoch(
+            epochs_axis, ign_rates, save=True,
+            save_path=str(PLOTS_DIR / f"rates_{stage_base}.png"),
+        )
+
+        # push the complete run to B2 last, once every artifact exists, so the
+        # cloud box holds nothing that is not also durable: weights (best and
+        # final), the calibrator, all four plots, and the TensorBoard run dir
+        if self.export_b2:
+            export_to_b2(
+                MODEL_SAVE_DIR / f"{stage_base}.th",
+                final_path,
+                MODEL_SAVE_DIR / f"{stage_base}.calib.json",
+                PLOTS_DIR / f"reliability_{stage_base}.png",
+                PLOTS_DIR / f"class_accuracy_{stage_base}.png",
+                PLOTS_DIR / f"losses_{stage_base}.png",
+                PLOTS_DIR / f"rates_{stage_base}.png",
+                RUNS_DIR / run_name,
+                prefix=f"firefusion/{self.dataset_name}",
+            )
 
     def test(self):
         return
@@ -484,8 +509,8 @@ if __name__ == "__main__":
                              "defaults to the experiment's per-stage value")
     parser.add_argument("--alpha-ign", type=float, default=None, help="ignition loss weight")
     parser.add_argument("--alpha-cause", type=float, default=None, help="cause loss weight")
-    parser.add_argument("--export-s3", action="store_true",
-                        help="upload final weights + calibrator to AWS_S3_BUCKET when training ends")
+    parser.add_argument("--export-b2", action="store_true",
+                        help="upload final weights + calibrator to Backblaze B2 (B2_* env) when training ends")
     args = parser.parse_args()
 
     device, num_workers = get_device_config(maximum=2)
@@ -535,6 +560,6 @@ if __name__ == "__main__":
         freeze = freeze,
         alpha_ign = alpha_ign,
         alpha_cause = alpha_cause,
-        export_s3 = args.export_s3,
+        export_b2 = args.export_b2,
         debug = False
     )

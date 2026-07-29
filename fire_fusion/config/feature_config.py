@@ -117,6 +117,7 @@ class Feature:
 
     # Special attrs
     kde_smooth_radius_km: Optional[float] = None
+    kde_half_life_days: Optional[float] = None      # decay half-life for the KDE accumulator
     expand_names: Optional[List[str]] = None # names of new features base feature is expanded into
     
     # labels and masks
@@ -143,78 +144,124 @@ def get_masks():
 
 def base_feat_config():
     return {
-        "GRIDMET": [
+        "PRISM": [
             Feature(
                 name = "temp_avg",
-                key = "tmm",
-                clip = (-40.0, 120.0), #Far
+                key = "tmean",
+                clip = (-40.0, 120.0),
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
                 ds_norms = ["z_score"],
             ),
             Feature(
-                name = "wind_mph",
-                key = "vs",
+                name = "temp_min",
+                key = "tmin",
+                clip = (-40.0, 120.0),
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
-                ds_clip = (0.0, 100.0),
-                ds_norms = ["log1p", "z_score"]
+                ds_norms = ["z_score"],
             ),
             Feature(
-                name = "wind_dir",
-                key = "th",
-                clip = (0.0, 360.0),
+                name = "temp_max",
+                key = "tmax",
+                clip = (-40.0, 120.0),
                 resampling = Resampling.bilinear,
-                # nearest: linear interpolation of a raw angle blends through
-                # 180 degrees on 359->1 wraparounds
-                time_interp = ("existing", "nearest"),
-                # dropped
+                time_interp = ("existing", "linear"),
+                ds_norms = ["z_score"],
             ),
             Feature(
-                name = "precip_mm", # inchdes
-                key = "pr",
+                name = "dewpoint",
+                key = "tdmean",
+                clip = (-60.0, 90.0),
+                resampling = Resampling.bilinear,
+                time_interp = ("existing", "linear"),
+                ds_norms = ["z_score"],
+            ),
+            Feature(
+                name = "vpd_min",
+                key = "vpdmin",
+                resampling = Resampling.bilinear,
+                time_interp = ("existing", "linear"),
+                ds_clip = (0.0, 200.0),
+                ds_norms = ["log1p", "z_score"],
+            ),
+            Feature(
+                name = "vpd_max",
+                key = "vpdmax",
+                resampling = Resampling.bilinear,
+                time_interp = ("existing", "linear"),
+                ds_clip = (0.0, 200.0),
+                ds_norms = ["log1p", "z_score"],
+            ),
+            Feature(
+                name = "precip_mm",
+                key = "ppt",
                 clip = (0, 150),
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
-                ds_norms = ["log1p", "z_score"]
+                ds_norms = ["log1p", "z_score"],
             ),
+        ],
+        "AORC": [
             Feature(
-                name = "dead_fmo_100hr",
-                key = "fm100",
+                name = "rel_humidity",
+                key = "rel_humidity",
                 clip = (0.0, 100.0),
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
-                ds_norms = ["z_score"]
+                ds_norms = ["z_score"],
             ),
-            
             Feature(
-                name = "rel_humidity",
-                key = "rm",
+                # consumed by the fuel-moisture derivation, then dropped
+                name = "rh_max",
+                key = "rh_max",
+                clip = (0.0, 100.0),
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
-                ds_norms = ["z_score"],
+            ),
+            Feature(
+                name = "wind_mph",
+                key = "wind_mph",
+                resampling = Resampling.bilinear,
+                time_interp = ("existing", "linear"),
+                ds_clip = (0.0, 100.0),
+                ds_norms = ["log1p", "z_score"],
+            ),
+            Feature(
+                name = "wind_dir",
+                key = "wind_dir",
+                clip = (0.0, 360.0),
+                # nearest: a raw angle blends through 180 degrees on 359->1
+                # wraparounds under bilinear resampling
+                resampling = Resampling.nearest,
+                time_interp = ("existing", "nearest"),
+                # dropped
             ),
         ],
         "FIRE_USFS": [
             Feature(
+                # dropped for final label
                 name = "usfs_perimeter",
                 key = "Fire_Perimeter",
                 # NO TIME INTERPOLATION
-                # dropped
             ),
             Feature(
+                # dropped for final label
                 name = "usfs_burn",
                 key = "Fire_Occurence",
                 expand_names=["usfs_burn_occ", "usfs_burn_cause"]
                 # NO TIME INTERPOLATION
-                # dropped
             ),
             Feature(
                 name = "usfs_KDE",
-                # KDE names === "kde_[burn cause]"
+                # KDE names are "kde_[burn cause]"
                 expand_names = ["kde_natural_lightning", "kde_human", "kde_industrial", "kde_debris"],
                 key = "Fire_KDE",
                 kde_smooth_radius_km = 20,
+                # annual half-life keeps a multi-year spatial ignition prior while
+                # holding the accumulator stationary, so a train-fit z_score stays
+                # calibrated on the chronologically later eval/test years
+                kde_half_life_days = 365,
                 ds_norms = ["z_score"]
                 # NO TIME INTERPOLATION
             ),
@@ -267,11 +314,12 @@ def base_feat_config():
                 ds_norms = ["z_score"]
             ),
             Feature(
+                # dropped
                 name = "lf_aspect",
                 key = "_Asp",
                 resampling = Resampling.bilinear,
                 time_interp = ("broadcast", "linear"),
-                # dropped
+                
             ),
         ],
         "MODIS": [
@@ -286,14 +334,13 @@ def base_feat_config():
                 ds_norms = ["z_score"],
             ),
             Feature(
+                # dropped
                 name = "mod13q1", # step function holds values for dropoffs (fires)
                 expand_names = ["modis_ndvi", "modis_water_mask"],
                 key = "MOD13Q1",
-                # simple reprojection
                 resampling = Resampling.nearest,
                 # forward fill in proc_modis
                 # time_interp = ("existing", "nearest"),
-                # dropped
             ),
             Feature(
                 name = "modis_months_since_last_burn",
@@ -301,25 +348,17 @@ def base_feat_config():
                 # 0/1 is ordinal
                 resampling = Resampling.nearest,
                 # NO TIME INTERPOLATION, forward fill in proc_modis
-                # The ceiling value is a "never burned in the record" sentinel
-                # carrying ~96% of cells, not a measured duration. z-scoring a
-                # distribution that constant yields a tiny sigma and throws recent
+                # Ceiling is a "never burned in the record" sentinel
+                # carrying ~96% of cells, not a measured duration.
+                # z-scoring a distribution that constant yields a tiny sigma and throws recent
                 # burns out past -10 sigma, so this stays bounded in [0, 1];
                 # log1p first keeps resolution on the recent months that matter.
                 ds_norms = ["log1p", "minmax"],
             ),
         ],
-        
         "NLCD": [
-            # Feature(
-            #     name = "lcov_class",
-            #     key = "LndCov",
-            #     resampling = Resampling.nearest,
-            #     time_interp = ("broadcast", "nearest"),
-            #     num_classes = 9,
-            #     one_hot_encode = True
-            #     # dropped
-            # ),
+            # LndCov class not used
+            # using other features in place
             Feature(
                 name = "frac_imp_surface",
                 key = "FctImp",
@@ -338,11 +377,10 @@ def base_feat_config():
         "LIGHTNING": [
             Feature(
                 name = "lightning_strikes",
-                # daily CG strike count per 0.1 deg tile, gridded nearest onto
-                # the master cells inside the processor
+                # daily CG strike count per 0.1 deg tile
                 resampling = Resampling.nearest,
                 # the product already carries a value (>=1 or a true zero) for
-                # every day, so no temporal interpolation is applied
+                # every day, so no temporal interpolation applied
                 time_interp = None,
                 ds_norms = ["log1p", "z_score"],
             )
@@ -360,9 +398,12 @@ def base_feat_config():
 
 
 def drv_feat_config() -> List[Feature]:
-    """ SEQUENTIAL list of features to derive """
+    """ 
+        SEQUENTIAL list of features to derive 
+        NOTE: order matters. Some derived features utilize outputs of earlier entries
+    """
     return [
-        # Fire/Masks
+        # === Labels/Masks FIRST ===
         Feature(name="ign_next", is_label=True, 
             func="build_ignition_next",
             inputs=["usfs_burn_occ", "usfs_perimeter"],
@@ -377,10 +418,12 @@ def drv_feat_config() -> List[Feature]:
             drop_inputs=["usfs_burn_occ", "usfs_perimeter"],
             ds_norms = ["log1p", "z_score"],
         ),
+        # must be after ign_next
         Feature(name="ign_next_cause", is_label=True, 
             func="build_ign_next_cause",
             inputs=["usfs_burn_cause", "ign_next"],
         ),
+        # must be after ign_next
         Feature(name="valid_cause_mask", is_mask=True,
             func="build_valid_cause_mask",
             inputs=["usfs_burn_cause", "ign_next"],
@@ -391,14 +434,13 @@ def drv_feat_config() -> List[Feature]:
             inputs=["modis_water_mask"],
             drop_inputs=["modis_water_mask"],
         ),
-        # Derivations
+        # === Derivations ===
         Feature(
             name = "ndvi_anomaly",
             func = "build_ndvi_anomaly",
             inputs=["modis_ndvi"],
             drop_inputs=["modis_ndvi"],
-            # symmetric clip: negative anomalies (drier than climatology) carry
-            # the fire-relevant signal
+            # symmetric clip: negative anomalies (drier than climatology) carry fire-relevant signal 
             ds_clip=(-1.0, 1.0),
             ds_norms = ["z_score"],
         ),
@@ -407,9 +449,13 @@ def drv_feat_config() -> List[Feature]:
             inputs=["precip_mm"], drop_inputs = None,
             ds_norms = ["log1p", "z_score"],
         ),
-        # exponentially-decayed running sum of CG strikes: a holdover proxy for
-        # ignitions that smoulder for days after a strike. The same-day strike
-        # count is kept as a second channel rather than dropped.
+        Feature(expand_names = ["dead_fmo_100hr", "dead_fmo_1000hr"],
+            func = "build_dead_fuel_derived",
+            inputs=["temp_min", "temp_max", "rel_humidity", "rh_max", "precip_mm"],
+            # EMCbar uses the diurnal extremes; rh_max is consumed and dropped.
+            drop_inputs=["rh_max"],
+            ds_norms = ["z_score"],
+        ),
         Feature(name = "lightning_load",
             func = "build_lightning_load",
             inputs=["lightning_strikes"], drop_inputs = None,
@@ -431,8 +477,7 @@ def drv_feat_config() -> List[Feature]:
             inputs=["temp_avg", "rel_humidity", "wind_mph"],
             ds_norms = ["z_score"],
         ),
-        # indexes
-        
+        # === indexes ===
         Feature(
             name = "doy_sin",
             func="build_doy_sin",

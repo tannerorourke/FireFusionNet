@@ -37,7 +37,8 @@ from fire_fusion.config.feature_config import (
 from .processors.processor import Processor
 from .processors.proc_derived_feats import DerivedProcessor
 from .processors.proc_gpw import GPW
-from .processors.proc_gridmet import GridMet
+from .processors.proc_prism import Prism
+from .processors.proc_aorc import Aorc
 from .processors.proc_landfire import Landfire
 from .processors.proc_lightning import Lightning
 from .processors.proc_modis import Modis
@@ -77,7 +78,8 @@ PROC_CLASSES = {
     "USDA_WUI": UsdaWui,
     "FIRE_USFS": UsfsFire,
     "GPW": GPW,
-    "GRIDMET": GridMet,
+    "PRISM": Prism,
+    "AORC": Aorc,
     "LANDFIRE": Landfire,
     "LIGHTNING": Lightning,
     "MODIS": Modis,

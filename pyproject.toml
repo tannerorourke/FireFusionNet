@@ -32,6 +32,11 @@ dependencies = [
     "dask",
     "earthaccess",
     "boto3",
+    # raw-weather ingest: PRISM web service (HTTP) and AORC anonymous S3 zarr
+    "requests",
+    "s3fs",
+    # training telemetry (per-epoch scalars + console log mirror)
+    "tensorboard",
 ]
 
 [tool.uv]

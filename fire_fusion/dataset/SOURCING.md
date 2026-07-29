@@ -117,16 +117,34 @@ Environmental Information.
   - **TOTAL_COUNT:** CG strikes in the tile that day
   - A tile-day is written only when ≥1 strike is detected → an absent tile-day is a true zero.
 
-## gridMET
+## PRISM (AN81d 800m daily)
 
-- [.sh script generator](https://www.climatologylab.org/wget-gridmet.html)
-- [Reference](https://planetarycomputer.microsoft.com/api/stac/v1/collections/gridmet)
+1981-present meteorology coverage at 800m. terrain-aware. Downloaded + consolidated to annual per-variable NetCDF by `proc_prism.py` run as a module (`python -m fire_fusion.dataset.processors.proc_prism`).
+
+- [Web service docs (PDF)](https://prism.oregonstate.edu/documents/PRISM_downloads_web_service.pdf)
+- Download endpoint: `https://services.nacse.org/prism/data/get/us/800m/{var}/{YYYYMMDD}` — returns a zipped COG (native EPSG:4326). Throttle to <2 req/s.
+- **Vars:** `ppt` (mm), `tmean`/`tmin`/`tmax`/`tdmean` (°C → converted to °F in processor), `vpdmin`/`vpdmax` (hPa).
+- Free 800m daily since 2025-03-27; full 1981-present coverage at 800m.
+
+## NOAA AORC (v1.1 ~800m)
+
+Humidity + wind (the fields PRISM lacks), hourly-native. Streamed from S3 and
+reduced to daily fire-weather fields by `proc_aorc.py` run as a module (`python -m fire_fusion.dataset.processors.proc_aorc`).
+
+- [AWS Open Data registry](https://registry.opendata.aws/noaa-nws-aorc/)
+- Store: `s3://noaa-nws-aorc-v1-1-1km/{year}.zarr` (anonymous; consolidated Zarr; native EPSG:4326, ~0.008333°, lat ascending; "1km" in the name is a misnomer for 800m).
+- **Source vars:** `SPFH_2maboveground` (kg/kg), `TMP_2maboveground` (K), `PRES_surface` (Pa), `UGRD_10maboveground`/`VGRD_10maboveground` (m/s).
+- **Derived daily:** `rel_humidity` (daily-min RH %, via Bolton 1980 e_s), `rh_max` (daily-max RH %), `wind_mph` (daily-mean speed), `wind_dir` (daily vector-mean wind-from direction).
 
 ## TIGER/Line Shapefiles
+
+Census road vector data. Exact to < 10m.
 
 - [Data](https://www.census.gov/cgi-bin/geo/shapefiles/index.php)
 
 ## GPWv4
+
+Gridded Population of the World
 
 - [Gridded Population of the World](https://search.earthdata.nasa.gov/search?fpj=GPW&oe=t&fsm0=Population&fst0=Human+Dimensions&lat=37.29469630844446&long=-72.07369294814293)
 - [Gridded Population of the World, Version 4 (GPWv4)](https://doi.org/10.7927/H4F47M65): Population Density Adjusted to Match 2015 Revision UN WPP Country Totals, Revision 11Version: 4.11Creator: Center for International Earth Science Information Network - CIESIN - Columbia UniversityPublisher: ESDISRelease Date: 2018-12-31T00:00:00.000ZRelease Place: Palisades, NYLinkage
