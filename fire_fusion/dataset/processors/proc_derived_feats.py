@@ -22,6 +22,7 @@ FM1000_SEED = 30.0                              # operational spin-up default (%
 # Full-time series working size of one fuel-moisture spatial block. The scan
 # holds several equal-sized arrays (boundaries + output) per task.
 FUEL_BLOCK_BYTES = 96 * 1024 ** 2
+IGN_BLOCK_BYTES = 128 * 1024 ** 2
 
 
 def _emc(Tf: np.ndarray, H: np.ndarray) -> np.ndarray:
@@ -136,6 +137,16 @@ class DerivedProcessor:
             (subds["usfs_burn_occ"].fillna(0) > 0) |
             (subds["usfs_perimeter"].fillna(0) > 0)
         )
+        # the forward window shifts along time only, so blocking y/x is exact and
+        # keeps each task off the full-grid footprint that OOMs at fine resolution
+        if burning_t.chunks is not None:
+            nt = burning_t.sizes["time"]
+            edge = max(1, int(np.sqrt(IGN_BLOCK_BYTES / nt)))
+            burning_t = burning_t.chunk({
+                "time": -1,
+                "y": min(burning_t.sizes["y"], edge),
+                "x": min(burning_t.sizes["x"], edge),
+            })
         future_burn = burning_t.shift(time=-1, fill_value=False)
         for k in range(2, horizon + 1):
             future_burn = future_burn | burning_t.shift(time=-k, fill_value=False)
@@ -196,6 +207,14 @@ class DerivedProcessor:
         """
         cause_t = burn_cause_t.argmax(dim="burn_cause")
         cause_t = xr.where(burn_cause_t.sum(dim="burn_cause") > 0, cause_t, -1)
+        if cause_t.chunks is not None:
+            nt = cause_t.sizes["time"]
+            edge = max(1, int(np.sqrt(IGN_BLOCK_BYTES / (nt * 8))))
+            cause_t = cause_t.chunk({
+                "time": -1,
+                "y": min(cause_t.sizes["y"], edge),
+                "x": min(cause_t.sizes["x"], edge),
+            })
 
         next_cause = cause_t.shift(time=-1, fill_value=-1)
         for k in range(2, horizon + 1):

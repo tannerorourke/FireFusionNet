@@ -86,8 +86,6 @@ PROC_CLASSES = {
     "NLCD": NLCD,
 }
 
-# -----------------------------------------------------------------------------------
-# -----------------------------------------------------------------------------------
 
 class FeatureGrid:
     """ Builds one named dataset (see config/dataset_config.py):
@@ -124,7 +122,6 @@ class FeatureGrid:
         self._extract_to_staging()
         self._finalize_splits()
 
-    # --- Phase 1: extract ---------------------------------------------------------
 
     def _extract_to_staging(self) -> None:
         print("Warming up GPU using low-emission wildfire simulations...")
@@ -218,9 +215,10 @@ class FeatureGrid:
 
     def _print_layer_stats(self, name: str, da: xr.DataArray) -> None:
         try:
-            # skipna reductions ignore NaN in place; the old `where(isfinite)`
-            # first materialized a float64 copy of the whole layer, which at
-            # 4-D cause-grid scale (~2e9 cells) was ~16 GB and blew the guard.
+            # stream the reductions over time chunks; a full-array mean/std on a
+            # large cube materializes a float64 deviation copy (~8x) that OOMs
+            if da.chunks is None and "time" in da.dims:
+                da = da.chunk({"time": self.cfg.stage_time_chunk})
             total = da.size
             is_int = np.issubdtype(da.dtype, np.integer)
             if is_int:
@@ -246,7 +244,6 @@ class FeatureGrid:
         except Exception as e:
             print(f"  + {name} (stats print failed: {e})")
 
-    # --- Phase 2: finalize ----------------------------------------------------------
 
     def _finalize_splits(self) -> None:
         ds = xr.open_zarr(self.cfg.staging_path)
@@ -544,8 +541,6 @@ class FeatureGrid:
         for c in feature_names:
             print(f"  channel: {c}")
 
-# -----------------------------------------------------------------------------------
-# -----------------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build a named FireFusion dataset")

@@ -130,7 +130,8 @@ def fetch_year(fs, year: int) -> None:
     daily = daily.rio.write_crs("EPSG:4326")
 
     AORC_DIR.mkdir(parents=True, exist_ok=True)
-    daily.to_netcdf(out)
+    # zlib keeps the smooth daily fields ~3-4x smaller on disk and over the wire to B2
+    daily.to_netcdf(out, encoding={v: {"zlib": True, "complevel": 4} for v in daily.data_vars})
     print(f"[AORC] wrote {out.name}  {dict(daily.sizes)}")
 
 

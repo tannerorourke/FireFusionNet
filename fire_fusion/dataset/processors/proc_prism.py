@@ -69,7 +69,6 @@ class Prism(Processor):
         return feature
 
     def _transform(self, val: xr.DataArray, f_cfg: Feature) -> xr.DataArray:
-        """ Unit conversion (Celsius temps -> Fahrenheit) and clip. """
         if f_cfg.key in TEMP_KEYS:
             val = xr.apply_ufunc(C_to_F, val).astype("float32")
         if f_cfg.clip is not None:
@@ -79,9 +78,6 @@ class Prism(Processor):
         return val.astype("float32")
 
 
-# ----------------------------------------------------------------------
-# Fetch (module entrypoint)
-# ----------------------------------------------------------------------
 PRISM_VARS = ["ppt", "tmean", "tmin", "tmax", "tdmean", "vpdmin", "vpdmax"]
 URL = "https://services.nacse.org/prism/data/get/us/800m/{var}/{date}"
 HEADERS = {"User-Agent": "firefusion-ingest"}
@@ -94,26 +90,44 @@ REQ_INTERVAL = 0.55       # seconds between requests (< 2/s)
 MAX_RETRIES = 5
 
 
+class PrismDailyCap(Exception):
+    """ NACSE's per-file 2x/day cap notice; never retried, as retries deepen it. """
+
+
 def _fetch_day(var: str, date: str) -> xr.DataArray:
-    """ Download one day's COG, clip to the WA extent, return a (y, x) array. """
+    # NACSE serves over-quota and transient failures as a 200 with a text body,
+    # so validate zip magic before parsing: the cap is fatal, other bodies retry.
     url = URL.format(var=var, date=date)
+    err = None
     for attempt in range(MAX_RETRIES):
-        r = requests.get(url, headers=HEADERS, timeout=180)
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=180)
+        except requests.exceptions.RequestException as e:
+            err = e
+            time.sleep(2.0 * (attempt + 1))
+            continue
         if r.status_code in (429, 503):
             time.sleep(2.0 * (attempt + 1))
             continue
         r.raise_for_status()
-        break
-    else:
-        raise RuntimeError(f"[PRISM] {var} {date} throttled past {MAX_RETRIES} retries")
 
-    zf = zipfile.ZipFile(io.BytesIO(r.content))
-    tif = next(n for n in zf.namelist() if n.endswith(".tif"))
-    da = rioxarray.open_rasterio(io.BytesIO(zf.read(tif)), masked=True)
-    if "band" in da.dims:
-        da = da.squeeze("band", drop=True)
-    da = da.rio.clip_box(minx=LON_MIN, miny=LAT_MIN, maxx=LON_MAX, maxy=LAT_MAX)
-    return da.astype("float32")
+        body = r.content
+        if body[:2] == b"PK":                               # zip local-file magic
+            zf = zipfile.ZipFile(io.BytesIO(body))
+            tif = next(n for n in zf.namelist() if n.endswith(".tif"))
+            da = rioxarray.open_rasterio(io.BytesIO(zf.read(tif)), masked=True)
+            if "band" in da.dims:
+                da = da.squeeze("band", drop=True)
+            da = da.rio.clip_box(minx=LON_MIN, miny=LAT_MIN, maxx=LON_MAX, maxy=LAT_MAX)
+            return da.astype("float32")
+
+        note = body[:300].decode("utf-8", "replace").strip()
+        if "more than twice" in note or "IP address" in note:
+            raise PrismDailyCap(f"{var} {date}: {note}")
+        err = RuntimeError(f"non-zip body: {note}")
+        time.sleep(2.0 * (attempt + 1))
+
+    raise RuntimeError(f"[PRISM] {var} {date} failed after {MAX_RETRIES} retries: {err}")
 
 
 def fetch_year(var: str, year: int) -> None:
@@ -133,7 +147,8 @@ def fetch_year(var: str, year: int) -> None:
     stacked = stacked.rio.write_crs("EPSG:4326")
 
     PRISM_DIR.mkdir(parents=True, exist_ok=True)
-    stacked.to_netcdf(out)
+    # zlib keeps the smooth met fields ~3-4x smaller on disk and over the wire to B2
+    stacked.to_netcdf(out, encoding={var: {"zlib": True, "complevel": 4}})
     print(f"[PRISM] wrote {out.name}  {dict(stacked.sizes)}")
 
 
@@ -143,9 +158,13 @@ def main() -> None:
     ap.add_argument("--vars", nargs="+", default=PRISM_VARS, choices=PRISM_VARS)
     args = ap.parse_args()
 
-    for var in args.vars:
-        for year in range(args.years[0], args.years[1] + 1):
-            fetch_year(var, year)
+    try:
+        for var in args.vars:
+            for year in range(args.years[0], args.years[1] + 1):
+                fetch_year(var, year)
+    except PrismDailyCap as e:
+        print(f"[PRISM] daily cap reached, stopping before an IP block: {e}")
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":
