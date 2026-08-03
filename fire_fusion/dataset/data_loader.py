@@ -15,21 +15,24 @@ import xarray as xr
 
 from ..config.dataset_config import DatasetConfig, get_dataset_config
 
-"""
-An output cell's receptive field reaches 16 cells in each direction, so a crop
-supervised out to its own border would be trained on cells whose context is
-partly zero padding -- padding that only ever occurs at the true domain edge
-during full-grid inference. Crops therefore carry a halo of this width that
-supplies real context and is excluded from the loss.
-"""
-CROP_HALO = 16
+# -- the encoder's total stride and the attention window compose, so a crop whose
+# -- origin is not a multiple of their product shifts the window partition relative
+# -- to a full-grid pass and changes the prediction for the same cell
+def crop_align(encoder_depth: int, attn_window: int) -> int:
+    return (2 ** encoder_depth) * attn_window
 
-"""
-The encoder's stride (2) and the attention window (2) compose, so a crop whose
-origin is not a multiple of 4 shifts the window partition relative to a
-full-grid pass and changes the prediction for the same cell.
-"""
-CROP_ALIGN = 4
+
+# -- A crop supervised out to its own border would be trained on cells whose context
+# -- is partly zero padding, which only ever occurs at the true domain edge during
+# -- full-grid inference. Crops therefore carry a halo of real context, excluded
+# -- from the loss, as wide as the receptive field radius of one output cell:
+# -- 5 through the stem and the full-resolution residual stage, 7 * (2^d - 1) across
+# -- the stride-2 stages, 2^d * (attn_window - 1) across the attention window, and
+# -- 2^(d+1) - 1 back through the decoder's per-level 3x3.
+def crop_halo(encoder_depth: int, attn_window: int) -> int:
+    d, align = encoder_depth, crop_align(encoder_depth, attn_window)
+    radius = 5 + 7 * (2 ** d - 1) + (2 ** d) * (attn_window - 1) + (2 ** (d + 1) - 1)
+    return -(-radius // align) * align
 
 from dask import config as daskconfig
 # zarr reads happen inside DataLoader workers; nested dask threads only add overhead
@@ -50,6 +53,8 @@ class FireDataset(Dataset):
         window_stride: int = 2,
         crop_size: int | None = None,
         crop_seed: int | None = None,
+        encoder_depth: int = 1,
+        attn_window: int = 2,
     ):
         super().__init__()
         self.manifest = json.loads(ds_config.manifest_path.read_text())
@@ -69,6 +74,7 @@ class FireDataset(Dataset):
         )
         self.n_cause_classes = int(self.manifest["n_cause_classes"])
         self.ign_pos_weight = float(self.manifest["ign_pos_weight"])
+        self.cause_counts = [int(c) for c in self.manifest["cause_counts"]]
 
         if self.X.sizes["channel"] != self.in_channels:
             raise ValueError(
@@ -103,26 +109,37 @@ class FireDataset(Dataset):
         # on every side, so a crop_size of 96 reads 128x128 and supervises the
         # middle 96x96
         self.crop_size = crop_size
+        self.crop_align = crop_align(encoder_depth, attn_window)
+        self.crop_halo = crop_halo(encoder_depth, attn_window)
         self._rng = np.random.default_rng(crop_seed)
         if crop_size is not None:
-            if crop_size % CROP_ALIGN:
-                raise ValueError(f"crop_size {crop_size} must be a multiple of {CROP_ALIGN}")
-            self.read_size = crop_size + 2 * CROP_HALO
+            if crop_size % self.crop_align:
+                raise ValueError(f"crop_size {crop_size} must be a multiple of {self.crop_align}")
+            self.read_size = crop_size + 2 * self.crop_halo
             H, W = self.out_size
             if self.read_size > H or self.read_size > W:
                 raise ValueError(
-                    f"crop_size {crop_size} needs a {self.read_size}px read, "
+                    f"crop_size {crop_size} needs a {self.read_size}px read "
+                    f"({self.crop_halo}px halo at encoder depth {encoder_depth}), "
                     f"larger than the {H}x{W} grid"
                 )
+            # An extent that is not a multiple of the alignment leaves the far edge
+            # short of the last legal origin, so a strip of it is never read during
+            # training while evaluation still scores it. Grids built since the
+            # alignment was enforced have no such strip.
+            strip = [f"{n}{ax}" for ax, n in (("y", H % self.crop_align), ("x", W % self.crop_align)) if n]
+            if strip:
+                print(f"crop training cannot reach {', '.join(strip)} at the far edge "
+                      f"of the {H}x{W} grid (alignment {self.crop_align})")
 
     def __len__(self) -> int:
         return len(self.window_starts)
 
     def _crop_origin(self) -> Tuple[int, int]:
-        """ Aligned top-left origin for a halo-padded read. """
         H, W = self.out_size
-        y = self._rng.integers(0, (H - self.read_size) // CROP_ALIGN + 1) * CROP_ALIGN
-        x = self._rng.integers(0, (W - self.read_size) // CROP_ALIGN + 1) * CROP_ALIGN
+        align = self.crop_align
+        y = self._rng.integers(0, (H - self.read_size) // align + 1) * align
+        x = self._rng.integers(0, (W - self.read_size) // align + 1) * align
         return int(y), int(x)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict, Dict]:
@@ -135,9 +152,10 @@ class FireDataset(Dataset):
             keep = None
         else:
             y0, x0 = self._crop_origin()
+            H, W = self.out_size
             ysel = slice(y0, y0 + self.read_size)
             xsel = slice(x0, x0 + self.read_size)
-            keep = slice(CROP_HALO, CROP_HALO + self.crop_size)
+            keep = (self._keep_span(y0, H), self._keep_span(x0, W))
 
         x = torch.from_numpy(
             np.ascontiguousarray(self.X.isel(time=slice(t0, t1), y=ysel, x=xsel).values)
@@ -161,22 +179,26 @@ class FireDataset(Dataset):
             }
         return x, labels, masks
 
+    # -- a crop side that sits on the domain edge loses no context there: its padding
+    # -- is the padding full-grid inference sees anyway, so those cells stay supervised.
+    # -- Holding them out instead would leave a halo-wide band of the domain that
+    # -- training never scores and evaluation always does.
+    def _keep_span(self, origin: int, extent: int) -> slice:
+        lo = 0 if origin == 0 else self.crop_halo
+        hi = self.read_size if origin + self.read_size == extent else self.read_size - self.crop_halo
+        return slice(lo, hi)
+
     @staticmethod
-    def _halo_masked(mask: torch.Tensor, keep: slice) -> torch.Tensor:
+    def _halo_masked(mask: torch.Tensor, keep: Tuple[slice, slice]) -> torch.Tensor:
         out = torch.zeros_like(mask)
-        out[keep, keep] = mask[keep, keep]
+        out[keep[0], keep[1]] = mask[keep[0], keep[1]]
         return out
 
 
 def _seed_worker(worker_id: int) -> None:
-    """ Give each worker process its own reproducible RNG state.
-
-    A worker receives a pickled copy of the dataset, so every worker would
-    otherwise inherit one crop RNG at an identical state and draw the identical
-    sequence of crop origins. torch derives each worker's initial seed from the
-    loader's generator, which makes the reseed below both per-worker distinct
-    and a function of the run seed.
-    """
+    # -- a worker gets a pickled copy of the dataset, so without this reseed every
+    # -- worker would inherit one crop RNG and draw the identical crop origins.
+    # -- torch derives each worker's initial seed from the loader's generator.
     seed = torch.initial_seed() % 2**32
     np.random.seed(seed)
     random.seed(seed)
@@ -195,6 +217,8 @@ def init_data_loader(
     window_stride: int = 2,
     crop_size: int | None = None,
     seed: int | None = None,
+    encoder_depth: int = 1,
+    attn_window: int = 2,
 ):
     # cropping is a training-time device for grids that do not fit whole; eval
     # and test read the full extent so their metrics stay comparable across runs
@@ -205,6 +229,8 @@ def init_data_loader(
         window_stride=window_stride,
         crop_size=crop_size if split == "train" else None,
         crop_seed=seed,
+        encoder_depth=encoder_depth,
+        attn_window=attn_window,
     )
 
     # the shuffle order is drawn from the loader's own generator rather than the

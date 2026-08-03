@@ -65,13 +65,28 @@ class WRMTrainer:
         # still overflows
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
+        # the look-back length is a hyperparameter of the experiment, not a
+        # property of the loader; both splits must read the same one or the
+        # eval windows would not match what the model was trained on
+        window_size = training_params.get("window_size", 10)
+        window_stride = training_params.get("window_stride", 2)
+
+        # the crop halo and alignment are both consequences of the model geometry,
+        # so the loader is built from the same numbers the model is
+        encoder_depth = model_params.get("encoder_depth", 1)
+        attn_window = model_params["win_spatial_mixing"]["window_size"]
+
         self.train_loader = init_data_loader(
             "train", dataset_name, num_workers, training_params["batch_size"],
+            window_size=window_size, window_stride=window_stride,
             crop_size=training_params.get("crop_size"), seed=seed,
+            encoder_depth=encoder_depth, attn_window=attn_window,
         )
         self.eval_loader = init_data_loader(
             "eval", dataset_name, num_workers, training_params["batch_size"],
+            window_size=window_size, window_stride=window_stride,
             seed=seed,
+            encoder_depth=encoder_depth, attn_window=attn_window,
         )
 
         # channel count, output size, cause classes, and class balance come from
@@ -107,7 +122,11 @@ class WRMTrainer:
               f"alpha_ign={alpha_ign} alpha_cause={alpha_cause} "
               f"trainable_params={n_train}/{n_total}")
 
-        ep = training_params["epochs"]
+        # a head-only specialize stage converges in a fraction of the epochs a
+        # backbone needs, so a stage may carry its own budget
+        ep = training_params.get("stages", {}).get(stage, {}).get(
+            "epochs", training_params["epochs"]
+        )
         self.ep_warmup, self.ep_max, self.ep_early_stop = ep[0], ep[1], ep[2]
         self.min_lr = training_params["min_lr"]
         self.base_lr = training_params["base_lr"]
@@ -118,6 +137,18 @@ class WRMTrainer:
             [float(ign_pos_weight)], dtype=torch.float32, device=device
         )
         self.bcewl_loss = nn.BCEWithLogitsLoss(reduction="none", pos_weight=self.ign_pos_weight)
+
+        # Cause classes span roughly two orders of magnitude, so an unweighted mean
+        # cross-entropy is minimized by never predicting the rare ones. The cause
+        # score is macro-averaged over classes, which an inverse-frequency weight is
+        # the consistent estimator for; `cause_weight_beta` tempers it toward the
+        # empirical prior when the rarest class is too thin to carry full weight.
+        beta = training_params.get("cause_weight_beta", 1.0)
+        counts = torch.as_tensor(train_set.cause_counts, dtype=torch.float32, device=device)
+        w = (counts.sum() / counts.clamp(min=1)) ** beta
+        self.cause_weight = w / w.mean()
+        print(f"[WRMTrainer] cause_counts={train_set.cause_counts} beta={beta} "
+              f"cause_weight={[round(v, 3) for v in self.cause_weight.tolist()]}")
         # best epoch / early stopping key off the ignition head's masked PR-AUC
         # rather than total validation loss: it is the reported claim, and it
         # excludes the sparse cause term from the choice of checkpoint
@@ -130,14 +161,12 @@ class WRMTrainer:
 
     @staticmethod
     def _last_day(t: torch.Tensor) -> torch.Tensor:
-        """ Loaders emit (B, H, W) for the window's final day; tolerate (B, T, H, W). """
+        # -- loaders emit (B, H, W) for the window's final day; tolerate (B, T, H, W)
         return t[:, -1] if t.ndim == 4 else t
 
     def _prepare_targets(self, golds: Dict, masks: Dict):
-        """ Collapse any window-time dimension and build the per-head masks of
-            supervised cells. Loss and metrics both read these, so the reported
-            scores describe the population the model was actually trained on.
-        """
+        # -- loss and metrics both read these masks, so the reported scores always
+        # -- describe the same population the model was trained on
         ign_golds = self._last_day(golds["ign_next"])
         cause_golds = self._last_day(golds["ign_next_cause"])
         no_act_fire_mask = self._last_day(masks["no_act_fire_mask"])
@@ -163,7 +192,6 @@ class WRMTrainer:
         """ Compute BCELogitsLoss on a next-window ignition,
             as well as cross entropy loss on ignition TYPE given an ignition
         """
-        # === Ignition Loss: ignition within the forward window ===============
         ign_logits_flat = ign_logits.squeeze(1)
         ign_targets = ign_golds.float()
         ign_loss = self.bcewl_loss(
@@ -177,14 +205,14 @@ class WRMTrainer:
             (ign_mask.sum() + 1e-6)
         )
 
-        # === Cause loss: =========================================
         if cause_mask.any():
             cause_logits_flat = cause_logits.permute(0, 2, 3, 1)[cause_mask]
             cause_targets_flat = cause_golds[cause_mask].long()
 
             cause_loss = nn.functional.cross_entropy(
-                cause_logits_flat, 
-                cause_targets_flat, 
+                cause_logits_flat,
+                cause_targets_flat,
+                weight=self.cause_weight,
                 reduction="mean"
             )
         else:
@@ -438,6 +466,14 @@ class WRMTrainer:
         final_path = save_model(self.model, name_base=stage_base)
         print(f"Saved final weights >> {final_path}")
 
+        # The calibrator is a sidecar of `<stage_base>.th`, which holds the best
+        # epoch's weights -- so it has to be fit against those weights, not the
+        # ones left in memory by however many epochs ran after the best.
+        best_path = MODEL_SAVE_DIR / f"{stage_base}.th"
+        if self.mm.best["epoch"] and best_path.exists():
+            load_model(self.model, best_path, map_location=self.device)
+            print(f"Restored best weights (epoch {self.mm.best['epoch']}) for calibration")
+
         # a calibrator is only meaningful once the ignition head has trained
         if self.freeze != "heads":
             self.fit_calibration()
@@ -513,8 +549,6 @@ if __name__ == "__main__":
                         help="upload final weights + calibrator to Backblaze B2 (B2_* env) when training ends")
     args = parser.parse_args()
 
-    device, num_workers = get_device_config(maximum=2)
-
     """ Model Params """
     with open(f'{MODEL_DIR}/params.json') as file:
         data = json.load(file)
@@ -526,6 +560,13 @@ if __name__ == "__main__":
 
     model_params        = params["model"]
     training_params     = params["training"]
+
+    # a window read decompresses a whole time-chunk of the split zarr, so the loader
+    # is IO-bound well before the GPU is and a many-core box wants several workers.
+    # Each one holds prefetched windows in pinned memory though, so the ceiling
+    # belongs to the experiment: a full-grid profile on a small card cannot afford
+    # what a cropped one can.
+    device, num_workers = get_device_config(maximum=training_params.get("max_workers", 8))
 
     # an experiment names the dataset and seed it was defined against, so the
     # experiment name alone reproduces the run; the flags are an escape hatch

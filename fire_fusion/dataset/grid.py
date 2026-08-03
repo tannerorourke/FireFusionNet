@@ -4,6 +4,9 @@ from rasterio.transform import from_origin
 import xarray as xr, rioxarray
 from pyproj import CRS, Transformer
 
+# -- sized for a 4-stage encoder with a 2-cell attention window, the deepest in use
+GRID_ALIGN = 32
+
 
 def season_time_index(
     start_date: str,
@@ -41,8 +44,8 @@ def season_time_index(
     return keep
 
 
+# -- which days of an extraction index carry supervision, i.e. are not halo
 def supervised_mask(time_index, season_months) -> np.ndarray:
-    """ Which days of an extraction index carry supervision (i.e. are not halo). """
     if season_months is None:
         return np.ones(len(time_index), dtype=bool)
     m0, m1 = season_months
@@ -85,10 +88,12 @@ def create_coordinate_grid(
     width_m = max_x - min_x
     height_m = max_y - min_y
 
-    # num of pixels in each direction, rounded up to multiples of 4 so the
-    # model's stride-2 stages and 2x2 window partitions divide evenly
-    npx_x = int(np.ceil(np.ceil(width_m / resolution) / 4) * 4)
-    npx_y = int(np.ceil(np.ceil(height_m / resolution) / 4) * 4)
+    # Crop origins are multiples of the model's total stride times its attention
+    # window. Where the extent is not itself such a multiple, the last aligned origin
+    # stops short of the far edge and a strip of the domain becomes unreadable during
+    # crop training while still being scored at evaluation.
+    npx_x = int(np.ceil(np.ceil(width_m / resolution) / GRID_ALIGN) * GRID_ALIGN)
+    npx_y = int(np.ceil(np.ceil(height_m / resolution) / GRID_ALIGN) * GRID_ALIGN)
 
     # Snap upper-right corner to exact pixel grid
     max_x_aligned = min_x + npx_x * resolution

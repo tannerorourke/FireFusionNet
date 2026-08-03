@@ -55,7 +55,6 @@ class Processor:
                     epsg = "4326"
                 if epsg is None:
                     raise ValueError("no crs")
-                # obj = obj.rio.write_crs(self.mCRS)
                 obj = obj.rio.write_crs(f"EPSG:{epsg}")
                 obj = obj.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=False)
                 # CRS recovered from the attribute, so the array can take the
@@ -112,6 +111,10 @@ class Processor:
 
     def _reproject_to_mgrid_fn(self, obj: xr.DataArray, resample_type = None) -> xr.DataArray:
         """ Don't call me. Call _reproject_arr_to_mgrid OR _reproject_dataset_to_mgrid """
+        # -- Float sources with NaN gaps need nodata=NaN, else reproject_match backfills gaps
+        # -- and out-of-extent cells with the float32 sentinel ~3.4e38. Int sources keep their fill.
+        if obj.rio.nodata is None and np.issubdtype(obj.dtype, np.floating):
+            obj = obj.rio.write_nodata(np.nan)
         if resample_type is None:
             obj = obj.rio.reproject_match(self.gridref)
         else:

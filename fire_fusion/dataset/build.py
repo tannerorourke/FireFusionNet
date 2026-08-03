@@ -52,8 +52,7 @@ from .processors.proc_usda import UsdaWui
 # than the store size; wa2000 measures ~10.5 GB at 4.
 SPLIT_WRITE_WORKERS = 4
 
-# zstd trades a little write throughput for ~25% smaller stores than lz4 at the
-# same level, with the byte shuffle doing most of the work on float32 planes.
+# zstd trades a bit of throughput for ~25% smaller stores than lz4
 SPLIT_COMPRESSOR = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
 
 # Labels and masks are int8/uint8 and overwhelmingly zero, so they compress to
@@ -63,7 +62,7 @@ LABEL_TIME_CHUNK = 64
 
 
 def _rss_gb() -> float:
-    """ Resident set size of this process, for extraction memory tracing. """
+    # Resident set size of this process, for extraction memory tracing
     try:
         with open("/proc/self/status") as fh:
             for line in fh:
@@ -144,8 +143,7 @@ class FeatureGrid:
                 if isinstance(layer, xr.DataArray):
                     layer = layer.to_dataset(name=layer.name or config.name)
 
-                # An empty Dataset means the processor already streamed its
-                # parts through the sink
+                # An empty Dataset means the processor already streamed its parts through the sink
                 if len(layer.data_vars) > 0:
                     self._write_layer(layer)
 
@@ -168,9 +166,8 @@ class FeatureGrid:
         layer = layer.drop_vars("spatial_ref", errors="ignore")
 
         # Several processors return float64 only because xarray's .interp()
-        # promotes; X is assembled as float32, so the extra precision is
-        # discarded downstream regardless. Narrowing here halves the staging
-        # cube and the finalize working set.
+        # promotes; X is assembled as float32, so halving here cuts the memory
+        # block size down without loss of precision.
         for name, da in layer.items():
             if da.dtype == np.float64:
                 layer[name] = da.astype("float32")
@@ -193,9 +190,7 @@ class FeatureGrid:
         self._staging_initialized = True
 
     def _check_grid_alignment(self, name: str, da: xr.DataArray) -> None:
-        """ The staging cube replaces the old outer-merge; misaligned coords
-            must fail loudly instead of silently expanding the axes
-        """
+        # -- misaligned coords must fail loudly instead of silently expanding the axes
         ny, nx = self.grid.sizes["y"], self.grid.sizes["x"]
         if "y" not in da.dims or "x" not in da.dims:
             raise ValueError(f"[FeatureGrid] '{name}' missing spatial dims: {da.dims}")
@@ -262,15 +257,13 @@ class FeatureGrid:
         ds, norm_stats = self._apply_normalize(ds)
         ds = self._fill_missing(ds)
         pos_weight = self._compute_pos_weight(ds)
-        self._save_splits(ds, norm_stats, pos_weight, n_cause_classes)
+        cause_counts = self._compute_cause_counts(ds, n_cause_classes)
+        self._save_splits(ds, norm_stats, pos_weight, n_cause_classes, cause_counts)
 
+    # -- keeps only supervised (in-season) days. A staging cube built before seasonal
+    # -- windowing holds every day of the record, a superset of any halo range, so
+    # -- this selects out of either layout.
     def _drop_halo(self, ds: xr.Dataset) -> xr.Dataset:
-        """ Keep only supervised (in-season) days.
-
-            A staging cube built before seasonal windowing holds every day of the
-            record, which is a superset of any halo range, so this selects out of
-            either layout.
-        """
         if self.cfg.season_months is None:
             return ds
 
@@ -404,7 +397,8 @@ class FeatureGrid:
             if name in excluded:
                 continue
             if np.issubdtype(ds[name].dtype, np.floating):
-                ds[name] = ds[name].fillna(0.0)
+                # -- catches +/-inf as well as NaN, so an overflow upstream cannot survive into X
+                ds[name] = ds[name].where(np.isfinite(ds[name]), 0.0)
         return ds
 
     def _compute_pos_weight(self, ds: xr.Dataset) -> float:
@@ -431,8 +425,31 @@ class FeatureGrid:
         )
         return ign_pos_weight
 
+    # -- counted on the same cells the cause head is supervised on, so a loss weight
+    # -- derived from these matches the population it is applied to
+    def _compute_cause_counts(self, ds: xr.Dataset, n_cause_classes: int) -> List[int]:
+        train_slice = slice(
+            f"{self.cfg.train_yrs[0]}-01-01", f"{self.cfg.train_yrs[1]}-12-31"
+        )
+        ign = ds["ign_next"].sel(time=train_slice)
+        cause = ds["ign_next_cause"].sel(time=train_slice)
+        no_act_fire_mask = ds["no_act_fire_mask"].sel(time=train_slice)
+        land_mask = ds["land_mask"].sel(time=train_slice)
+
+        supervised = (land_mask == 1) & (no_act_fire_mask == 1) & (ign == 1) & (cause != -1)
+        counts = dask.compute(*[
+            ((cause == c) & supervised).sum() for c in range(n_cause_classes)
+        ])
+        counts = [int(c) for c in counts]
+        print(
+            f"[FeatureGrid] Cause classes (train split): {counts}",
+            f"- imbalance = {max(counts) / max(min(counts), 1):.1f}x"
+        )
+        return counts
+
     def _save_splits(
-        self, ds: xr.Dataset, norm_stats: Dict, pos_weight: float, n_cause_classes: int
+        self, ds: xr.Dataset, norm_stats: Dict, pos_weight: float,
+        n_cause_classes: int, cause_counts: List[int]
     ) -> None:
         print("Spraying neutrino stabilization goo in sub-basement level 7...")
         excluded = set(self.label_names) | set(self.mask_names)
@@ -529,6 +546,7 @@ class FeatureGrid:
             # the metrics cannot drift from the classes the labels actually carry
             "n_cause_classes": n_cause_classes,
             "ign_pos_weight": pos_weight,
+            "cause_counts": cause_counts,
             "norm_stats": norm_stats,
             "built_at": datetime.now(timezone.utc).isoformat(),
         }

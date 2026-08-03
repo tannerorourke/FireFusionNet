@@ -42,12 +42,13 @@ class FireFusionModel(nn.Module):
 
         cm_chunk    =cm_params.get('chunk_size', 4096)
         n_causes    =mp['n_cause_classes']
+        depth       =mp.get('encoder_depth', 1)
 
-        self.encoder = SpatialEncoder(in_channels, embed_dim)
+        self.encoder = SpatialEncoder(in_channels, embed_dim, depth=depth)
         self.ws_attn = WindowedSpatialAttention(embed_dim, num_heads=ws_heads, window_size=ws_win_size, dropout=ws_dropout)
         self.cm_attn = ChannelMixingAttention(num_heads=cm_heads, num_channels=embed_dim, d_model=cm_d_model, mlp_ratio=cm_mlp_ratio, dropout=cm_dropout, chunk_size=cm_chunk)
         self.tm_attn = TemporalMixingAttention(embed_dim, num_heads=tm_heads, mlp_ratio=tm_mlp_ratio, dropout=tm_dropout)
-        self.decoder = BiHeadDecoder(embed_dim, n_cause_classes=n_causes)
+        self.decoder = BiHeadDecoder(embed_dim, n_cause_classes=n_causes, depth=depth, base_ch=self.encoder.base_ch)
 
         # The backbone ("main") produces the shared representation; the decoder
         # ("heads") turns it into the ignition and cause maps. Grouping them here
@@ -60,10 +61,9 @@ class FireFusionModel(nn.Module):
     def set_frozen(self, freeze_main: bool = False, freeze_heads: bool = False):
         """ Toggle gradient flow for the backbone and decoder groups.
 
-        A frozen group is also switched to eval so its dropout and any
-        normalization statistics stay fixed while the other group trains —
-        otherwise the "stable" representation a head specializes against would
-        still be perturbed stochastically each step.
+            - a frozen group also switches to eval, so dropout stays fixed while
+              the other group trains; otherwise the representation a head specializes
+              against would still be stochastically perturbed each step
         """
         self._frozen_main = freeze_main
         self._frozen_heads = freeze_heads
@@ -90,7 +90,7 @@ class FireFusionModel(nn.Module):
         return self
 
     def forward(self, x: torch.Tensor):
-        y = self.encoder(x)
+        y, skips = self.encoder(x)
         y = self.ws_attn(y)
         y = self.cm_attn(y)
         y = self.tm_attn(y)
@@ -98,7 +98,7 @@ class FireFusionModel(nn.Module):
         # Only decode the prediction from the last day
         y = y[:, -1]
 
-        outputs = self.decoder(y)
+        outputs = self.decoder(y, skips)
         return outputs
 
 
