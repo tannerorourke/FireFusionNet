@@ -13,28 +13,20 @@ As a case study, we train a spatiotemporal ConvFormer on the datacube to predict
 - Custom derived features: Per-cause ignition KDE's, 3x3 cell 7d rolling fire occurrence, NDVI anomalies, 2 and 5-day cumulative precipitation, 100 and 1000-hr dead fuel moisture, decayed lightning load, Fosberg FWI.
 - Circular quantities (N/S and E/W aspect and wind-direction components, day-of-year) decomposed into orthogonal components, so no channel carries 0/360 discontinuities.
 - Fire ignition time, cause, KDE by cause, 3x3 rolling fire occurrence, and months since last burn.
-- Land and active fire masks
+- Water and active fire masks
 
 ## Datasets
 
 Four datacubes, available on HuggingFace, are the intended way to use this work.
 
-Each spans 2003-2020 and includes a raw `dataset.zarr` including normalized raw and derived features, as well as a `2003-2016`/`2017-2018`/`2019-2020` train/eval/test split (used in flagship model). The `wa****` datasets cover the full state. `cascades250` narrows to a 144 x 144 km (20,736 km$^2$) window over the Northeastern Cascades, which carries ~30% of Washington's ignition cell-days on 12% of its land area (3.1x increase), useful for fine-tuning. Each dataset .
+Each spans 2003-2020 and includes a raw `dataset.zarr` including normalized raw and derived features, as well as a `2003-2016`/`2017-2018`/`2019-2020` train/eval/test split, used in flagship model. The `wa****` datasets cover the full state. `cascades250` narrows to a 144 x 144 km (20,736 km$^2$) window over the North-eastern Cascades, which carries ~30% of Washington's ignition cell-days on 12% of its land area (3.1x increase), useful for fine-tuning.
 
 | Dataset | Resolution | Grid (y, x) | Coverage | Dataset |
 | --- | --- | --- | --- | --- |
 | `wa4000` | 4000 m | 102 x 109 | Washington State | [torq1/fire-fusion-wa-4000m](https://huggingface.co/datasets/torq1/fire-fusion-wa-4000m) |
 | `wa2000` | 2000 m | 204 x 217 | Washington State | [torq1/fire-fusion-wa-2000m](https://huggingface.co/datasets/torq1/fire-fusion-wa-2000m) |
 | `wa1000` | 1000 m | 407 x 433 | Washington State | [torq1/fire-fusion-wa-1000m](https://huggingface.co/datasets/torq1/fire-fusion-wa-1000m) |
-| `cascades250` | 250 m | 576 x 576 | Eastern Cascades corridor | [torq1/fire-fusion-wa-cascades-250m](https://huggingface.co/datasets/torq1/fire-fusion-wa-cascades-250m) |
-
-Common to every tier:
-
-| | |
-| --- | --- |
-| CRS | EPSG:32610 (UTM Zone 10N) |
-| record | 2003-2020, supervised over the May-October fire season |
-| supervised days | 184 per year, 3312 total |
+| `cascades250` | 250 m | 576 x 576 | North-eastern Cascades corridor | [torq1/fire-fusion-wa-cascades-250m](https://huggingface.co/datasets/torq1/fire-fusion-wa-cascades-250m) |
 
 ## Sources
 
@@ -61,7 +53,7 @@ See `fire_fusion/dataset/SOURCING.md` for authoritative info on products, versio
 | Name | Meaning |
 | --- | --- |
 | `ign_next` | 1 if a currently-clear cell burns within the next 7 days |
-| `ign_next_cause` | cause of the earliest such ignition: natural/lightning, human, industrial, debris |
+| `ign_next_cause` | cause of the earliest such ignition. `dataset.zarr` carries four classes (natural/lightning, human, industrial, debris). The splits fold debris into industrial, leaving three |
 | `land_mask` | 1 on land |
 | `no_act_fire_mask` | 1 where the cell is not already burning |
 | `valid_cause_mask` | 1 where a usable cause label exists |
@@ -131,11 +123,13 @@ uv pip compile requirements.txt -o requirements.lock.txt --generate-hashes # reg
 ## Commands
 
 - `python -m fire_fusion.dataset.build --dataset <name> --stage <extract|publish|compile|all>`: build a datacube.
-- `python -m fire_fusion.model.train --[experiment] --[dataset] --[seed] --[stage] --[init-from] --[freeze] --[alpha-ign] --[alpha-cause] --[export-s3]`: train the ConvFormer. Requires a built dataset under `data/processed`.
-- `python -m fire_fusion.model.predict --[experiment] --[dataset] --[checkpoint] --[calib] --[split] --[batches]`: turn a trained checkpoint into per-cell ignition probabilities.
+- `python -m fire_fusion.train --[experiment] --[dataset] --[seed] --[stage] --[init-from] --[freeze] --[alpha-ign] --[alpha-cause] --[export-b2]`: train the ConvFormer. Requires a built dataset under `data/processed`.
+- `python -m fire_fusion.predict --[experiment] --[dataset] --[checkpoint] --[calib] --[split] --[batches]`: turn a trained checkpoint into per-cell ignition probabilities.
 
 ## Data availability
 
-Rebuilding the dataset (i.e., at a new resolution) sits behind a mix of gated API tokens, bulk-download requests, and rate limits: MODIS access needs a NASA Earthdata token, and PRISM's service caps downloads per file per day.
+Note the data is reprojected to EPSG:32610 (UTM Zone 10N) CRS and does not transfer cleanly to other states without rebuilding data from scratch. 
+
+Rebuilding from raw data requires a mix of gated API tokens, bulk-download requests, and patience waiting over rate limits
 
 If you would like to learn more, or want to dig into the data deeper, please reach out to me personally!

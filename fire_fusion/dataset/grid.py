@@ -48,12 +48,15 @@ def supervised_mask(time_index, season_months) -> np.ndarray:
     return (months >= m0) & (months <= m1)
 
 
+GRID_CRS = "EPSG:32610"  # -- UTM Zone 10N, least distorted single zone over WA
+
+
 def create_coordinate_grid(
     time_index,
     resolution: float,
     lat_bounds = (45.4, 49.1),
     lon_bounds = (-124.8, -117.0),
-    crs = "EPSG:32610" # UT Zone 10N (better for single state)
+    crs = GRID_CRS
 ) -> xr.DataArray:
     """
     Defines coordinate grid to place features on top of

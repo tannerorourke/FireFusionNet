@@ -24,8 +24,8 @@ from fire_fusion.config.dataset_config import (
     DATASET_CONFIGS, DatasetConfig, get_dataset_config
 )
 from fire_fusion.config.feature_config import (
-    Feature, base_feat_config, drv_feat_config,
-    get_labels, get_masks
+    Feature, base_feat_config, drv_feat_config, get_labels, get_masks,
+    cause_index_remap, compiled_cause_classes,
 )
 
 from .processors.processor import Processor
@@ -306,6 +306,7 @@ class FeatureGrid:
 
         ds, redone_stats = self._recompute_train_dependent(ds)
         ds = self._apply_drop_inputs(ds)
+        ds, n_cause_classes = self._merge_cause_classes(ds, n_cause_classes)
         # Normalize while missing cells are still NaN, so statistics only see
         # valid observations; the zero-fill afterwards lands on the post-norm mean
         ds, stat_stats = self._apply_statistical(ds)
@@ -325,6 +326,24 @@ class FeatureGrid:
             norm_stats[f] = det + stat_stats.get(f, [])
 
         self._save_splits(ds, norm_stats, pos_weight, n_cause_classes, cause_counts)
+
+    def _merge_cause_classes(self, ds: xr.Dataset, n_cause: int) -> Tuple[xr.Dataset, int]:
+        # -- folds the CAUSE_MERGE pairs into single labels. Applied here rather
+        # -- than at extraction so the published cube keeps every raw class and a
+        # -- different grouping costs a recompile instead of a rebuild.
+        remap = cause_index_remap()
+        if all(k == v for k, v in remap.items()):
+            return ds, n_cause
+
+        # index shifted by one so the -1 'no cause' sentinel maps through the same table
+        lut = np.array([-1] + [remap[i] for i in range(n_cause)], dtype="int8")
+        ds["ign_next_cause"] = xr.apply_ufunc(
+            lambda a: lut[a + 1], ds["ign_next_cause"],
+            dask="parallelized", output_dtypes=[np.int8],
+        )
+        merged = compiled_cause_classes()
+        print(f"[FeatureGrid] cause classes {n_cause} -> {len(merged)}: {merged}")
+        return ds, len(merged)
 
     # -- keeps only supervised (in-season) days. A staging cube built before seasonal
     # -- windowing holds every day of the record, a superset of any halo range, so

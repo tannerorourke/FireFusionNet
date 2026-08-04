@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 import numpy as np
 from rasterio.enums import Resampling
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from xarray.core.types import InterpOptions
 
 
@@ -12,6 +12,27 @@ CAUSAL_CLASSES = [
     "INDUSTRIAL",
     "DEBRIS"
 ]
+
+# Classes folded together when the splits are written. Debris is a few hundred
+# labelled cell-days vs five-figs for lightning.
+# The cube keeps all four, reversing this is a recompile.
+CAUSE_MERGE = {"DEBRIS": "INDUSTRIAL"}
+
+
+def compiled_cause_classes() -> List[str]:
+    # -- CAUSAL_CLASSES after merging, in output order; index is the label value
+    out: List[str] = []
+    for c in CAUSAL_CLASSES:
+        target = CAUSE_MERGE.get(c, c)
+        if target not in out:
+            out.append(target)
+    return out
+
+
+def cause_index_remap() -> Dict[int, int]:
+    # -- extracted class index -> compiled class index
+    compiled = compiled_cause_classes()
+    return {i: compiled.index(CAUSE_MERGE.get(c, c)) for i, c in enumerate(CAUSAL_CLASSES)}
 
 # Ignition horizon: a clear cell is positive if it burns within this many days,
 # and the cause label and its validity mask read the same forward window. A day
