@@ -59,14 +59,10 @@ def load_predictor(
 ) -> FirePredictor:
     """ Rebuild the model, load weights, attach a calibrator.
 
-    Channel count, cause classes, and the class weight come from the dataset
-    manifest (as at train time); the attention/embedding shape comes from the
-    params.json `experiment` the checkpoint was trained with, so a mismatched
-    experiment surfaces immediately as a strict state_dict error. The grid extent
-    is not a model parameter -- the output tracks whatever extent is fed in.
-
-    Dataset and checkpoint default to the ones the experiment trained against,
-    so an experiment name is enough to reload its run.
+    Channel count, cause classes, and class weight come from the dataset manifest;
+    the attention and embedding shape come from the params.json experiment, so a
+    mismatch surfaces as a strict state_dict error. Grid extent is not a model
+    parameter. Dataset and checkpoint default to the experiment's own.
     """
     if device is None:
         device, _ = get_device_config(maximum=1)
@@ -128,10 +124,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     with open(f"{MODEL_DIR}/params.json") as f:
-        dataset = args.dataset or json.load(f)[args.experiment]["dataset"]
+        params = json.load(f)[args.experiment]
+    dataset = args.dataset or params["dataset"]
 
     predictor = load_predictor(dataset, args.experiment, args.checkpoint, args.calib)
-    loader = init_data_loader(args.split, dataset, num_workers=0, batch_size=1)
+    # -- the loader trims the grid to the encoder's stride-window product, so these
+    # -- must match the trained experiment or inference runs on a different extent
+    loader = init_data_loader(
+        args.split, dataset, num_workers=0, batch_size=1,
+        encoder_depth=params["model"]["encoder_depth"],
+        attn_window=params["model"]["win_spatial_mixing"]["window_size"],
+    )
 
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     for i, (features, _golds, masks) in enumerate(loader):

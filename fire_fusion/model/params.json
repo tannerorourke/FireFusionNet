@@ -206,6 +206,106 @@
       }
     }
   },
+  "wa4000-s1": {
+    "dataset": "wa4000",
+    "model": {
+      "embed_dim": 96,
+      "encoder_depth": 1,
+      "win_spatial_mixing": {
+        "num_heads": 4,
+        "window_size": 2,
+        "dropout": 0.1
+      },
+      "channel_mixing": {
+        "num_heads": 4,
+        "d_model": 32,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1,
+        "chunk_size": 4096
+      },
+      "temporal_mixing": {
+        "num_heads": 4,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1
+      }
+    },
+    "training": {
+      "seed": 1,
+      "batch_size": 12,
+      "epochs": [
+        5,
+        60,
+        10
+      ],
+      "min_lr": 1e-06,
+      "base_lr": 0.001,
+      "weight_decay": 0.0001,
+      "grad_clip": 1.0,
+      "crop_size": null,
+      "stages": {
+        "pretrain": {
+          "freeze": "none",
+          "alpha_ign": 1.0,
+          "alpha_cause": 0.0
+        },
+        "specialize": {
+          "freeze": "main",
+          "alpha_ign": 1.0,
+          "alpha_cause": 1.0
+        }
+      }
+    }
+  },
+  "wa4000-s2": {
+    "dataset": "wa4000",
+    "model": {
+      "embed_dim": 96,
+      "encoder_depth": 1,
+      "win_spatial_mixing": {
+        "num_heads": 4,
+        "window_size": 2,
+        "dropout": 0.1
+      },
+      "channel_mixing": {
+        "num_heads": 4,
+        "d_model": 32,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1,
+        "chunk_size": 4096
+      },
+      "temporal_mixing": {
+        "num_heads": 4,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1
+      }
+    },
+    "training": {
+      "seed": 2,
+      "batch_size": 12,
+      "epochs": [
+        5,
+        60,
+        10
+      ],
+      "min_lr": 1e-06,
+      "base_lr": 0.001,
+      "weight_decay": 0.0001,
+      "grad_clip": 1.0,
+      "crop_size": null,
+      "stages": {
+        "pretrain": {
+          "freeze": "none",
+          "alpha_ign": 1.0,
+          "alpha_cause": 0.0
+        },
+        "specialize": {
+          "freeze": "main",
+          "alpha_ign": 1.0,
+          "alpha_cause": 1.0
+        }
+      }
+    }
+  },
   "wa1000-s1": {
     "dataset": "wa1000",
     "model": {
@@ -341,7 +441,7 @@
       "base_lr": 0.0005,
       "weight_decay": 0.0001,
       "grad_clip": 1.0,
-      "crop_size": 256,
+      "crop_size": null,
       "stages": {
         "pretrain": {
           "freeze": "none",
@@ -391,7 +491,7 @@
       "base_lr": 0.0005,
       "weight_decay": 0.0001,
       "grad_clip": 1.0,
-      "crop_size": 256,
+      "crop_size": null,
       "stages": {
         "pretrain": {
           "freeze": "none",

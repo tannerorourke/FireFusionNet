@@ -4,9 +4,6 @@ from rasterio.transform import from_origin
 import xarray as xr, rioxarray
 from pyproj import CRS, Transformer
 
-# -- sized for a 4-stage encoder with a 2-cell attention window, the deepest in use
-GRID_ALIGN = 32
-
 
 def season_time_index(
     start_date: str,
@@ -16,14 +13,12 @@ def season_time_index(
     halo_trail_days: int = 10,
 ) -> pd.DatetimeIndex:
     """
-    Days to extract. With `season_months` set, this is the union of one block
-    per year covering the season plus a halo on either side; without it, every
-    day between the bounds.
+    Days to extract. With season_months set, one block per year covering the
+    season plus a halo either side; without it, every day between the bounds.
 
-    The halo exists so temporal derivations (decayed lightning load, rolling
-    precipitation, the forward ignition horizon) enter the supervised window
-    with real history behind them instead of restarting at zero. Halo days are
-    dropped again before the splits are written, so they are never supervised.
+    The halo lets temporal derivations enter the supervised window with real
+    history behind them instead of restarting at zero. It is dropped before the
+    splits are written, so halo days are never supervised.
     """
     full = pd.date_range(start_date, end_date, freq="D")
     if season_months is None:
@@ -88,22 +83,21 @@ def create_coordinate_grid(
     width_m = max_x - min_x
     height_m = max_y - min_y
 
-    # Crop origins are multiples of the model's total stride times its attention
-    # window. Where the extent is not itself such a multiple, the last aligned origin
-    # stops short of the far edge and a strip of the domain becomes unreadable during
-    # crop training while still being scored at evaluation.
-    npx_x = int(np.ceil(np.ceil(width_m / resolution) / GRID_ALIGN) * GRID_ALIGN)
-    npx_y = int(np.ceil(np.ceil(height_m / resolution) / GRID_ALIGN) * GRID_ALIGN)
+    # -- the smallest grid covering the requested bounds. Rounding up to suit an
+    # -- encoder stride would append cells outside those bounds; alignment is the
+    # -- loader's concern and it trims rather than invents.
+    npx_x = int(np.ceil(width_m / resolution))
+    npx_y = int(np.ceil(height_m / resolution))
 
     # Snap upper-right corner to exact pixel grid
     max_x_aligned = min_x + npx_x * resolution
     max_y_aligned = min_y + npx_y * resolution
 
     transform = from_origin(
-        min_x,            # west (left)
-        max_y_aligned,    # north (top)
-        xsize=resolution,  # pixel width
-        ysize=resolution  # pixel height
+        min_x,              # west (left)
+        max_y_aligned,      # north (top)
+        xsize=resolution,   # pixel width
+        ysize=resolution    # pixel height
     )
 
     # MASTER pixel CENTERS coordinates in UTM meters

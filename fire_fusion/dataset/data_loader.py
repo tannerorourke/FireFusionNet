@@ -22,13 +22,10 @@ def crop_align(encoder_depth: int, attn_window: int) -> int:
     return (2 ** encoder_depth) * attn_window
 
 
-# -- A crop supervised out to its own border would be trained on cells whose context
-# -- is partly zero padding, which only ever occurs at the true domain edge during
-# -- full-grid inference. Crops therefore carry a halo of real context, excluded
-# -- from the loss, as wide as the receptive field radius of one output cell:
-# -- 5 through the stem and the full-resolution residual stage, 7 * (2^d - 1) across
-# -- the stride-2 stages, 2^d * (attn_window - 1) across the attention window, and
-# -- 2^(d+1) - 1 back through the decoder's per-level 3x3.
+# -- Crops carry a halo of real context, excluded from the loss, as wide as one
+# -- output cell's receptive field radius; without it the border trains on padding.
+# -- Radius: stem and residual 5, stride-2 stages 7*(2^d - 1), window 2^d*(ws - 1),
+# -- decoder 2^(d+1) - 1.
 def crop_halo(encoder_depth: int, attn_window: int) -> int:
     d, align = encoder_depth, crop_align(encoder_depth, attn_window)
     radius = 5 + 7 * (2 ** d - 1) + (2 ** d) * (attn_window - 1) + (2 ** (d + 1) - 1)
@@ -72,6 +69,16 @@ class FireDataset(Dataset):
             int(self.manifest["grid"]["height"]),
             int(self.manifest["grid"]["width"]),
         )
+        # -- An extent that is not a multiple of the stride-window product partitions
+        # -- raggedly in the last encoder stage, and its far edge sits past the last
+        # -- legal crop origin. Every split trims to the same aligned extent, so all
+        # -- three score one domain.
+        self.crop_align = crop_align(encoder_depth, attn_window)
+        H, W = (n - n % self.crop_align for n in self.out_size)
+        if (H, W) != self.out_size:
+            print(f"trimming {self.out_size} -> {(H, W)} for alignment {self.crop_align}")
+        self.out_size = (H, W)
+
         self.n_cause_classes = int(self.manifest["n_cause_classes"])
         self.ign_pos_weight = float(self.manifest["ign_pos_weight"])
         self.cause_counts = [int(c) for c in self.manifest["cause_counts"]]
@@ -90,10 +97,10 @@ class FireDataset(Dataset):
             window_stride,
             dtype=int,
         )
-        # A seasonally windowed dataset jumps from one October to the next May,
-        # so consecutive positions are not always consecutive days. Windows are
-        # kept only where every step inside them is a single day; a window
-        # straddling the gap would present two fire seasons as one sequence.
+        # A seasonally windowed dataset jumps from one October to the next May, so
+        # consecutive positions are not always consecutive days. A window straddling
+        # that gap would present two fire seasons as one sequence, so only single-day
+        # steps are kept.
         if len(starts) and self.n_timesteps > 1:
             days = np.asarray(self.ds.indexes["time"], dtype="datetime64[D]")
             step = np.diff(days).astype(int)
@@ -109,28 +116,18 @@ class FireDataset(Dataset):
         # on every side, so a crop_size of 96 reads 128x128 and supervises the
         # middle 96x96
         self.crop_size = crop_size
-        self.crop_align = crop_align(encoder_depth, attn_window)
         self.crop_halo = crop_halo(encoder_depth, attn_window)
         self._rng = np.random.default_rng(crop_seed)
         if crop_size is not None:
             if crop_size % self.crop_align:
                 raise ValueError(f"crop_size {crop_size} must be a multiple of {self.crop_align}")
             self.read_size = crop_size + 2 * self.crop_halo
-            H, W = self.out_size
             if self.read_size > H or self.read_size > W:
                 raise ValueError(
                     f"crop_size {crop_size} needs a {self.read_size}px read "
                     f"({self.crop_halo}px halo at encoder depth {encoder_depth}), "
                     f"larger than the {H}x{W} grid"
                 )
-            # An extent that is not a multiple of the alignment leaves the far edge
-            # short of the last legal origin, so a strip of it is never read during
-            # training while evaluation still scores it. Grids built since the
-            # alignment was enforced have no such strip.
-            strip = [f"{n}{ax}" for ax, n in (("y", H % self.crop_align), ("x", W % self.crop_align)) if n]
-            if strip:
-                print(f"crop training cannot reach {', '.join(strip)} at the far edge "
-                      f"of the {H}x{W} grid (alignment {self.crop_align})")
 
     def __len__(self) -> int:
         return len(self.window_starts)
@@ -147,12 +144,12 @@ class FireDataset(Dataset):
         t1 = t0 + self.window_size
         last = t1 - 1
 
+        H, W = self.out_size
         if self.crop_size is None:
-            ysel = xsel = slice(None)
+            ysel, xsel = slice(0, H), slice(0, W)
             keep = None
         else:
             y0, x0 = self._crop_origin()
-            H, W = self.out_size
             ysel = slice(y0, y0 + self.read_size)
             xsel = slice(x0, x0 + self.read_size)
             keep = (self._keep_span(y0, H), self._keep_span(x0, W))
@@ -179,10 +176,10 @@ class FireDataset(Dataset):
             }
         return x, labels, masks
 
-    # -- a crop side that sits on the domain edge loses no context there: its padding
-    # -- is the padding full-grid inference sees anyway, so those cells stay supervised.
-    # -- Holding them out instead would leave a halo-wide band of the domain that
-    # -- training never scores and evaluation always does.
+    # -- a crop side on the domain edge loses no context: its padding is what
+    # -- full-grid inference sees anyway, so those cells stay supervised. Holding
+    # -- them out would leave a halo-wide band that training never scores and
+    # -- evaluation always does.
     def _keep_span(self, origin: int, extent: int) -> slice:
         lo = 0 if origin == 0 else self.crop_halo
         hi = self.read_size if origin + self.read_size == extent else self.read_size - self.crop_halo

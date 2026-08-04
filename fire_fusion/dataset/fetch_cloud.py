@@ -1,13 +1,17 @@
-""" 
-Backblaze B2 transit for raw source data and run artifacts
+"""
+Backblaze B2 transit for raw source data and run artifacts.
+
+Processed transfers are selected by build step, not by directory, so a training
+node pulls the splits without dragging the staging and published cubes with them.
 """
 
 import argparse
 import os
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
+from ..config.dataset_config import DATASET_CONFIGS
 from ..config.path_config import (
     RAW_DATA_DIR, PROCESSED_DATA_DIR, LANDFIRE_DIR, NLCD_DIR, GPW_DIR, CROADS_DIR,
     USFS_DIR, PRISM_DIR, AORC_DIR, MODIS_DIR, USDA_DIR, NCEI_SWDI_DIR,
@@ -25,6 +29,15 @@ RAW_SOURCES: Dict[str, Path] = {
         LANDFIRE_DIR, NLCD_DIR, GPW_DIR, CROADS_DIR, USFS_DIR,
         PRISM_DIR, AORC_DIR, MODIS_DIR, USDA_DIR, NCEI_SWDI_DIR,
     ]
+}
+
+# One build step writes each of these and a consumer wants exactly one: a training
+# node needs the splits, a release needs the published cube. Naming members
+# explicitly also keeps stray directories out of a push.
+PROCESSED_STEPS: Dict[str, Tuple[str, ...]] = {
+    "staging": ("cube.zarr",),
+    "published": ("dataset.zarr", "dataset_manifest.json"),
+    "splits": ("train.zarr", "eval.zarr", "test.zarr", "manifest.json"),
 }
 
 
@@ -96,7 +109,7 @@ def _resolve_sources(names: Optional[Iterable[str]]) -> Dict[str, Path]:
     return {n: RAW_SOURCES[n] for n in names}
 
 
-def _processed_datasets(names: Optional[Iterable[str]]) -> list:
+def _processed_datasets(names: Optional[Iterable[str]]) -> List[str]:
     if names:
         return list(names)
     # push with no explicit list -> every built cube on local disk; a pull needs
@@ -106,6 +119,31 @@ def _processed_datasets(names: Optional[Iterable[str]]) -> list:
     return sorted(p.name for p in PROCESSED_DATA_DIR.iterdir() if p.is_dir())
 
 
+def _step_members(steps: Iterable[str]) -> List[str]:
+    seen = {m: None for s in steps for m in PROCESSED_STEPS[s]}
+    return list(seen)
+
+
+def _sync_processed(
+    store: "B2Store", action: str, ds: str, 
+    members: Iterable[str], overwrite: bool
+) -> None:
+    for member in members:
+        local = PROCESSED_DATA_DIR / ds / member
+        key = f"{PROCESSED_PREFIX}/{ds}/{member}"
+        if action == "push":
+            if local.is_dir():
+                store.put_tree(local, key, overwrite)
+            elif local.is_file():
+                store.put_file(local, key, overwrite)
+            else:
+                print(f"[B2] {local} absent, skipping")
+        elif member.endswith(".json"):
+            store.get_file(key, local, overwrite)
+        else:
+            store.get_tree(key, local, overwrite)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sync source data and built cubes between local disk and B2.")
     ap.add_argument("action", choices=["push", "pull"])
@@ -113,8 +151,10 @@ def main() -> None:
                     help="raw sources (data/raw) or built cubes (data/processed)")
     ap.add_argument("--sources", nargs="+", choices=sorted(RAW_SOURCES), default=None,
                     help="raw only: subset of sources; default all")
-    ap.add_argument("--datasets", nargs="+", default=None,
+    ap.add_argument("--datasets", nargs="+", choices=sorted(DATASET_CONFIGS), default=None,
                     help="processed only: dataset names; push defaults to all built locally")
+    ap.add_argument("--step", nargs="+", choices=sorted(PROCESSED_STEPS), default=["splits"],
+                    help="processed only: which build steps' outputs to move")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
@@ -127,13 +167,9 @@ def main() -> None:
             else:
                 store.get_tree(prefix, RAW_DATA_DIR / name, args.overwrite)
     else:
+        members = _step_members(args.step)
         for ds in _processed_datasets(args.datasets):
-            prefix = f"{PROCESSED_PREFIX}/{ds}"
-            local = PROCESSED_DATA_DIR / ds
-            if args.action == "push":
-                store.put_tree(local, prefix, args.overwrite)
-            else:
-                store.get_tree(prefix, local, args.overwrite)
+            _sync_processed(store, args.action, ds, members, args.overwrite)
 
 
 if __name__ == "__main__":

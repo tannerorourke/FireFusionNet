@@ -13,11 +13,10 @@ CAUSAL_CLASSES = [
     "DEBRIS"
 ]
 
-# Ignition prediction horizon (days). A clear cell is a positive if it burns on
-# any of the next IGN_HORIZON_DAYS days; the cause label and its validity mask
-# read the same forward window. A 1-day horizon leaves the positive class too
-# sparse to supervise; a week keeps the target a short-range forecast while
-# giving the ignition and cause heads enough signal.
+# Ignition horizon: a clear cell is positive if it burns within this many days,
+# and the cause label and its validity mask read the same forward window. A day
+# leaves the positive class too sparse to supervise; a week still reads as a
+# short-range forecast.
 IGN_HORIZON_DAYS = 7
 
 CAUSE_RAW_MAP = {
@@ -108,8 +107,8 @@ class Feature:
     name: str = ""
     key: Optional[str] = ""                         # unique key to access data
     clip: Optional[Tuple[float, float]] = None
-    resampling: Optional[Resampling] = None         # fill missing pixels in feature's grid
-    time_interp: Optional[Tuple[str, InterpOptions]] = None # "time" = broadcasting over time D, "existing" = fill missing
+    resampling: Optional[Resampling] = None         # strategy for filling missing pixels in feature grid
+    time_interp: Optional[Tuple[str, InterpOptions]] = None # "time" = broadcast over time D, "existing" = fill missing
     
     # OHEs
     num_classes: Optional[int] = 0
@@ -118,7 +117,7 @@ class Feature:
     # Special attrs
     kde_smooth_radius_km: Optional[float] = None
     kde_half_life_days: Optional[float] = None      # decay half-life for the KDE accumulator
-    expand_names: Optional[List[str]] = None # names of new features base feature is expanded into
+    expand_names: Optional[List[str]] = None        # names of new features base feature is expanded into
     
     # labels and masks
     inputs: Optional[List[str]] = None
@@ -126,7 +125,12 @@ class Feature:
     is_mask: Optional[bool] = False
     # derived features
     
-    func: Optional[str] = "" # DerivedProcessor function name
+    func: Optional[str] = ""                        # DerivedProcessor function signature
+    # -- the derivation estimates something from the record, so it cannot ship
+    # -- split-agnostic and is rebuilt against the train years at compile time.
+    # -- That rebuild sees supervised days only, so a temporal-window operator
+    # -- would lose its halo history and must not set this.
+    train_dependent: Optional[bool] = False
     drop_inputs: Optional[List[str] | None] = None
     ds_clip: Optional[Tuple[float, float]] = None   # clip values after processing
     ds_norms: Optional[List[str]] = None            # sequence of normalizations
@@ -135,8 +139,8 @@ class Feature:
 def get_labels():
     return [l for l in drv_feat_config() if l.is_label==True]
 
+# -- every mask equals 1 where the cell is usable for the head it gates
 def get_masks():
-    """ For all masks, equals 1 where the cell is usable for the head it gates """
     return (
         [f for f in drv_feat_config() if f.is_mask==True] +
         [f for feats in base_feat_config().values() for f in feats if f.is_mask==True]
@@ -348,11 +352,9 @@ def base_feat_config():
                 # 0/1 is ordinal
                 resampling = Resampling.nearest,
                 # NO TIME INTERPOLATION, forward fill in proc_modis
-                # Ceiling is a "never burned in the record" sentinel
-                # carrying ~96% of cells, not a measured duration.
-                # z-scoring a distribution that constant yields a tiny sigma and throws recent
-                # burns out past -10 sigma, so this stays bounded in [0, 1];
-                # log1p first keeps resolution on the recent months that matter.
+                # The ceiling is a 'never burned in the record' sentinel on ~96% of
+                # cells, not a duration. z-scoring that throws recent burns past
+                # -10 sigma, so this stays bounded; log1p keeps the recent months legible.
                 ds_norms = ["log1p", "minmax"],
             ),
         ],
@@ -397,13 +399,9 @@ def base_feat_config():
     }
 
 
+# -- order matters: later derivations consume the output of earlier ones
 def drv_feat_config() -> List[Feature]:
-    """ 
-        SEQUENTIAL list of features to derive 
-        NOTE: order matters. Some derived features utilize outputs of earlier entries
-    """
     return [
-        # === Labels/Masks FIRST ===
         Feature(name="ign_next", is_label=True, 
             func="build_ignition_next",
             inputs=["usfs_burn_occ", "usfs_perimeter"],
@@ -434,11 +432,11 @@ def drv_feat_config() -> List[Feature]:
             inputs=["modis_water_mask"],
             drop_inputs=["modis_water_mask"],
         ),
-        # === Derivations ===
         Feature(
             name = "ndvi_anomaly",
             func = "build_ndvi_anomaly",
             inputs=["modis_ndvi"],
+            train_dependent=True,
             drop_inputs=["modis_ndvi"],
             # symmetric clip: negative anomalies (drier than climatology) carry fire-relevant signal 
             ds_clip=(-1.0, 1.0),
@@ -477,7 +475,6 @@ def drv_feat_config() -> List[Feature]:
             inputs=["temp_avg", "rel_humidity", "wind_mph"],
             ds_norms = ["z_score"],
         ),
-        # === indexes ===
         Feature(
             name = "doy_sin",
             func="build_doy_sin",

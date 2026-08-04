@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
-# Two-phase datacube builder.
-#
-# Phase 1 (extract): every processor feature is written straight into a
-# staging zarr as it is produced, so peak memory is one feature layer rather
-# than the full cube.
-#
-# Phase 2 (finalize): the staging cube is reopened lazily (dask), derived
-# features / normalization / NaN-fill are applied out-of-core, and the
-# train/eval/test splits are written with all feature channels stacked into a
-# single (time, channel, y, x) float32 array "X" that the training loader can
-# slice directly. A manifest.json records channel order, normalization
-# statistics, grid shape, and the ignition class balance.
+"""
+Three-stage datacube builder. extract streams processor features into a
+staging zarr. publish derives them and applies deterministic normalization,
+giving a split-agnostic dataset.zarr. compile redoes train-dependent
+derivations, fits statistics on train, fills, and writes the splits.
+"""
 import argparse
 import json
 import os
 import shutil
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import dask
 import numpy as np
@@ -88,7 +82,7 @@ PROC_CLASSES = {
 
 class FeatureGrid:
     """ Builds one named dataset (see config/dataset_config.py):
-        raw sources -> staging cube.zarr -> {train,eval,test}.zarr + manifest.json
+        raw sources -> cube.zarr -> dataset.zarr -> {train,eval,test}.zarr + manifest.json
     """
     def __init__(self, ds_cfg: DatasetConfig):
         self.cfg = ds_cfg
@@ -118,11 +112,12 @@ class FeatureGrid:
         self._staging_initialized = False
 
     def build(self) -> None:
-        self._extract_to_staging()
-        self._finalize_splits()
+        self.extract()
+        self.publish()
+        self.compile()
 
 
-    def _extract_to_staging(self) -> None:
+    def extract(self) -> None:
         print("Warming up GPU using low-emission wildfire simulations...")
         self.cfg.root.mkdir(parents=True, exist_ok=True)
         if self.cfg.staging_path.exists():
@@ -240,24 +235,95 @@ class FeatureGrid:
             print(f"  + {name} (stats print failed: {e})")
 
 
-    def _finalize_splits(self) -> None:
+    def publish(self) -> None:
         ds = xr.open_zarr(self.cfg.staging_path)
-
-        # the cause head's width, read before the derived stage consumes and
-        # drops the one-hot cause grid
-        n_cause_classes = int(ds.sizes["burn_cause"])
-
-        ds = self._apply_derived(ds)
+        ds = self._apply_derived(ds, train_yrs=None)
         # Halo days have served their purpose once the temporal derivations have
         # run. Dropping them here rather than at write time keeps normalization
         # statistics and the class balance describing exactly the days that ship.
         ds = self._drop_halo(ds)
+        ds, det_stats = self._apply_deterministic(ds)
+        self._save_published(ds, det_stats)
+
+    def _save_published(self, ds: xr.Dataset, det_stats: Dict) -> None:
+        print("Publishing the split-agnostic cube...")
+        excluded = set(self.label_names) | set(self.mask_names)
+        ny, nx = ds.sizes["y"], ds.sizes["x"]
+        channels = sorted(str(n) for n in ds.data_vars if n not in excluded)
+        n_cause_classes = int(ds.sizes["burn_cause"])
+
+        for lname in self.label_names:
+            ds[lname] = ds[lname].astype("int8")
+        for mname in self.mask_names:
+            ds[mname] = ds[mname].astype("uint8")
+
+        ds = ds.chunk({
+            d: (self.cfg.stage_time_chunk if d == "time" else -1)
+            for d in ds.dims
+        })
+        ds.attrs.clear()
+        for v in ds.variables.values():
+            v.attrs.clear()
+            v.encoding.clear()
+
+        encoding = {str(n): {"compressor": SPLIT_COMPRESSOR} for n in ds.data_vars}
+        write_workers = min(SPLIT_WRITE_WORKERS, os.cpu_count() or SPLIT_WRITE_WORKERS)
+
+        if self.cfg.published_path.exists():
+            shutil.rmtree(self.cfg.published_path)
+        print(f"[FeatureGrid] writing published cube -> {self.cfg.published_path}")
+        with dask.config.set(scheduler="threads", num_workers=write_workers):
+            ds.to_zarr(self.cfg.published_path, mode="w", encoding=encoding)
+
+        manifest = {
+            "dataset": self.cfg.name,
+            "resolution_m": self.cfg.resolution,
+            "lat_bounds": list(self.cfg.lat_bounds),
+            "lon_bounds": list(self.cfg.lon_bounds),
+            "grid": {"height": ny, "width": nx},
+            "time": {
+                "start": self.cfg.start_date,
+                "end": self.cfg.end_date,
+                "season_months": (
+                    list(self.cfg.season_months) if self.cfg.season_months else None
+                ),
+                "contiguous": self.cfg.season_months is None,
+            },
+            "channels": channels,
+            "labels": self.label_names,
+            "masks": self.mask_names,
+            "n_cause_classes": n_cause_classes,
+            "norm_stats": det_stats,
+            "built_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.cfg.published_manifest_path.write_text(json.dumps(manifest, indent=2))
+        print(f"Saved published cube. channels: {len(channels)}")
+
+    def compile(self) -> None:
+        ds = xr.open_zarr(self.cfg.published_path)
+        # read before drop_inputs consumes the one-hot cause grid
+        n_cause_classes = int(ds.sizes["burn_cause"])
+
+        ds, redone_stats = self._recompute_train_dependent(ds)
+        ds = self._apply_drop_inputs(ds)
         # Normalize while missing cells are still NaN, so statistics only see
         # valid observations; the zero-fill afterwards lands on the post-norm mean
-        ds, norm_stats = self._apply_normalize(ds)
+        ds, stat_stats = self._apply_statistical(ds)
         ds = self._fill_missing(ds)
         pos_weight = self._compute_pos_weight(ds)
         cause_counts = self._compute_cause_counts(ds, n_cause_classes)
+
+        published = json.loads(self.cfg.published_manifest_path.read_text())
+        det_stats = published["norm_stats"]
+        excluded = set(self.label_names) | set(self.mask_names)
+        norm_stats: Dict[str, List[Dict]] = {}
+        for f in ds.data_vars:
+            if f in excluded:
+                continue
+            f = str(f)
+            det = redone_stats.get(f, det_stats.get(f, []))
+            norm_stats[f] = det + stat_stats.get(f, [])
+
         self._save_splits(ds, norm_stats, pos_weight, n_cause_classes, cause_counts)
 
     # -- keeps only supervised (in-season) days. A staging cube built before seasonal
@@ -276,16 +342,13 @@ class FeatureGrid:
         )
         return ds
 
-    def _apply_derived(self, ds: xr.Dataset) -> xr.Dataset:
+    def _apply_derived(self, ds: xr.Dataset, train_yrs: Optional[Tuple[int, int]]) -> xr.Dataset:
         print(f"[FeatureGrid] Deriving anti-arson techniques through feature derivation..")
 
-        # derivations that average over the record (the NDVI climatology) must
-        # see the train years only
-        drv_processor = DerivedProcessor(train_yrs=self.cfg.train_yrs)
+        drv_processor = DerivedProcessor(train_yrs=train_yrs)
         for cfg in self.drv_config:
-            func        = cfg.func
-            inputs      = cfg.inputs
-
+            func   = cfg.func
+            inputs = cfg.inputs
             new_fname = cfg.expand_names if cfg.expand_names else cfg.name
 
             if func:
@@ -302,21 +365,67 @@ class FeatureGrid:
                 elif isinstance(out, xr.Dataset):
                     ds = ds.merge(out)
 
-            if cfg.drop_inputs is not None:
-                try:
-                    ds = ds.drop_vars(cfg.drop_inputs)
-                except Exception as e:
-                    print(f"Failed to drop inputs for {new_fname}. Continuing")
-                    pass
-
-        # the burn_cause dimension coordinate outlives its dropped variable
-        ds = ds.drop_vars("burn_cause", errors="ignore")
-
         print(f"[FeatureGrid] Finished deriving features!")
         print(f"- dims: {ds.dims}")
         return ds
 
-    def _apply_normalize(self, ds: xr.Dataset) -> Tuple[xr.Dataset, Dict]:
+    # -- shared by the publish pass and by recomputing a single train-dependent
+    # -- feature; sound only because no feature's ds_norms mixes a deterministic
+    # -- step after a statistical one, checked below rather than assumed
+    def _deterministic_chain(
+        self, name: str, feature: xr.DataArray, f_config: Feature
+    ) -> Tuple[xr.DataArray, List[Dict]]:
+        norms = getattr(f_config, "ds_norms", None) or []
+        stat_types = {"z_score", "minmax", "scale_max"}
+        det_types = {"log1p", "to_sin"}
+        det_ix = [i for i, n in enumerate(norms) if n in det_types]
+        stat_ix = [i for i, n in enumerate(norms) if n in stat_types]
+        if det_ix and stat_ix and max(det_ix) > min(stat_ix):
+            raise ValueError(f"deterministic norm ordered after a statistical norm for '{name}'")
+
+        steps: List[Dict] = []
+        clip = getattr(f_config, "ds_clip", None)
+        if clip is not None:
+            feature = feature.clip(clip[0], clip[1])
+            steps.append({"step": "clip", "min": float(clip[0]), "max": float(clip[1])})
+
+        for ntype in norms:
+            if ntype == "log1p":
+                feature = xr.apply_ufunc(np.log1p, feature, dask="allowed")
+                steps.append({"step": "log1p"})
+            elif ntype == "to_sin":
+                feature = xr.apply_ufunc(np.sin, feature, dask="allowed")
+                steps.append({"step": "to_sin"})
+
+        return feature, steps
+
+    def _apply_deterministic(self, ds: xr.Dataset) -> Tuple[xr.Dataset, Dict[str, List[Dict]]]:
+        all_configs = (
+            [c for fl in base_feat_config().values() for c in fl] +
+            [c for c in drv_feat_config()]
+        )
+        det_stats: Dict[str, List[Dict]] = {}
+
+        for f in list(ds.data_vars):
+            if f in self.mask_names or f in self.label_names:
+                continue
+
+            f_config = next((
+                cfg for cfg in all_configs
+                if (cfg.name == f or f in (cfg.expand_names or []))
+            ), None)
+            if f_config is None:
+                print(f"can't find feature config for '{f}'")
+                continue
+
+            print(f"[FeatureGrid] deterministic norm {f}")
+            feature, steps = self._deterministic_chain(f, ds[f], f_config)
+            ds[f] = feature
+            det_stats[f] = steps
+
+        return ds, det_stats
+
+    def _apply_statistical(self, ds: xr.Dataset) -> Tuple[xr.Dataset, Dict[str, List[Dict]]]:
         # Statistics come from finite train-split cells only, and are re-computed
         # after each step in the norm chain so stacked transforms compose correctly
         train_slice = slice(
@@ -336,7 +445,7 @@ class FeatureGrid:
             [c for fl in base_feat_config().values() for c in fl] +
             [c for c in drv_feat_config()]
         )
-        norm_stats: Dict[str, List[Dict]] = {}
+        stat_stats: Dict[str, List[Dict]] = {}
 
         for f in list(ds.data_vars):
             if f in self.mask_names or f in self.label_names:
@@ -347,49 +456,62 @@ class FeatureGrid:
                 cfg for cfg in all_configs
                 if (cfg.name == f or f in (cfg.expand_names or []))
             ), None)
-
             if f_config is None:
                 print(f"can't find feature config for '{f}'")
                 continue
 
-            print(f"[FeatureGrid] normalizing {f}")
+            print(f"[FeatureGrid] statistical norm {f}")
             steps: List[Dict] = []
-
-            clip = getattr(f_config, "ds_clip", None)
-            if clip is not None:
-                feature = feature.clip(clip[0], clip[1])
-                steps.append({"step": "clip", "min": float(clip[0]), "max": float(clip[1])})
-
-            norms = getattr(f_config, "ds_norms", None)
-            if norms is not None:
-                for ntype in norms:
-                    if ntype == "log1p":
-                        feature = xr.apply_ufunc(np.log1p, feature, dask="allowed")
-                        steps.append({"step": "log1p"})
-                    elif ntype == "to_sin":
-                        feature = xr.apply_ufunc(np.sin, feature, dask="allowed")
-                        steps.append({"step": "to_sin"})
-                    elif ntype == "z_score":
-                        f_mean, f_std, _, _ = _train_stats(feature)
-                        f_std = f_std if f_std > 0 else 1.0
-                        feature = (feature - f_mean) / f_std
-                        steps.append({"step": "z_score", "mean": f_mean, "std": f_std})
-                    elif ntype == "minmax":
-                        _, _, f_min, f_max = _train_stats(feature)
-                        denom = abs(f_max - f_min)
-                        denom = denom if denom > 0.0 else 1.0
-                        feature = (feature - f_min) / denom
-                        steps.append({"step": "minmax", "min": f_min, "max": f_max})
-                    elif ntype == "scale_max":
-                        _, _, _, f_max = _train_stats(feature)
-                        f_max = f_max if f_max != 0 else 1.0
-                        feature = feature / f_max
-                        steps.append({"step": "scale_max", "max": f_max})
+            norms = getattr(f_config, "ds_norms", None) or []
+            for ntype in norms:
+                if ntype == "z_score":
+                    f_mean, f_std, _, _ = _train_stats(feature)
+                    f_std = f_std if f_std > 0 else 1.0
+                    feature = (feature - f_mean) / f_std
+                    steps.append({"step": "z_score", "mean": f_mean, "std": f_std})
+                elif ntype == "minmax":
+                    _, _, f_min, f_max = _train_stats(feature)
+                    denom = abs(f_max - f_min)
+                    denom = denom if denom > 0.0 else 1.0
+                    feature = (feature - f_min) / denom
+                    steps.append({"step": "minmax", "min": f_min, "max": f_max})
+                elif ntype == "scale_max":
+                    _, _, _, f_max = _train_stats(feature)
+                    f_max = f_max if f_max != 0 else 1.0
+                    feature = feature / f_max
+                    steps.append({"step": "scale_max", "max": f_max})
 
             ds[f] = feature
-            norm_stats[f] = steps
+            stat_stats[f] = steps
 
-        return ds, norm_stats
+        return ds, stat_stats
+
+    # -- the published copy of a train-dependent feature was derived over the
+    # -- whole record, which would let held-out years inform a training input
+    def _recompute_train_dependent(self, ds: xr.Dataset) -> Tuple[xr.Dataset, Dict[str, List[Dict]]]:
+        drv_processor = DerivedProcessor(train_yrs=self.cfg.train_yrs)
+        redone_stats: Dict[str, List[Dict]] = {}
+
+        for cfg in self.drv_config:
+            if not cfg.train_dependent:
+                continue
+            drv_fn = getattr(drv_processor, cfg.func)
+            out = drv_fn(ds[cfg.inputs], cfg.name)
+            ds[out.name] = out
+
+            feature, steps = self._deterministic_chain(cfg.name, ds[cfg.name], cfg)
+            ds[cfg.name] = feature
+            redone_stats[cfg.name] = steps
+
+        return ds, redone_stats
+
+    def _apply_drop_inputs(self, ds: xr.Dataset) -> xr.Dataset:
+        for cfg in self.drv_config:
+            if cfg.drop_inputs is not None:
+                ds = ds.drop_vars(cfg.drop_inputs, errors="ignore")
+        # the burn_cause dimension coordinate outlives its dropped variable
+        ds = ds.drop_vars("burn_cause", errors="ignore")
+        return ds
 
     def _fill_missing(self, ds: xr.Dataset) -> xr.Dataset:
         excluded = set(self.label_names) | set(self.mask_names)
@@ -476,7 +598,7 @@ class FeatureGrid:
         for mname in self.mask_names:
             out[mname] = ds[mname].astype("uint8")
 
-        ny, nx = self.grid.sizes["y"], self.grid.sizes["x"]
+        ny, nx = ds.sizes["y"], ds.sizes["x"]
         # `spatial_splits` rises with resolution to hold the per-chunk byte count
         # near wa2000's measured ~92 MB, which is what makes SPLIT_WRITE_WORKERS
         # a resolution-independent memory bound.
@@ -566,8 +688,16 @@ if __name__ == "__main__":
         "--dataset", default="wa2000",
         help=f"one of {sorted(DATASET_CONFIGS)} or 'all'",
     )
+    parser.add_argument(
+        "--stage", default="all", choices=["extract", "publish", "compile", "all"],
+        help="pipeline stage to run",
+    )
     args = parser.parse_args()
 
     names = sorted(DATASET_CONFIGS) if args.dataset == "all" else [args.dataset]
     for name in names:
-        FeatureGrid(get_dataset_config(name)).build()
+        grid = FeatureGrid(get_dataset_config(name))
+        if args.stage == "all":
+            grid.build()
+        else:
+            getattr(grid, args.stage)()
