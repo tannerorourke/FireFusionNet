@@ -1,6 +1,3 @@
-# Downloaded Data (~160gb)
-data/**
-
 # Build files
 logs
 *.zip
@@ -8,6 +5,12 @@ logs
 *.accdb
 *.7z
 *.tar.gz
+
+# Downloaded Data (~160gb), except the per-tier dataset cards.
+data/**
+!data/processed/
+!data/processed/*/
+!data/processed/*/README.md
 
 # training files
 *.th
