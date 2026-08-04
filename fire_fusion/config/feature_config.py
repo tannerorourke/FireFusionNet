@@ -266,7 +266,9 @@ def base_feat_config():
                 # holding the accumulator stationary, so a train-fit z_score stays
                 # calibrated on the chronologically later eval/test years
                 kde_half_life_days = 365,
-                ds_norms = ["z_score"]
+                # per_area first: the accumulator is fires per cell, and only a
+                # per-km2 density carries the same meaning across resolutions
+                ds_norms = ["per_area", "z_score"]
                 # NO TIME INTERPOLATION
             ),
         ],

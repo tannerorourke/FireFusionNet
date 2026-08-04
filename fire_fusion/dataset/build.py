@@ -377,7 +377,7 @@ class FeatureGrid:
     ) -> Tuple[xr.DataArray, List[Dict]]:
         norms = getattr(f_config, "ds_norms", None) or []
         stat_types = {"z_score", "minmax", "scale_max"}
-        det_types = {"log1p", "to_sin"}
+        det_types = {"log1p", "to_sin", "per_area"}
         det_ix = [i for i, n in enumerate(norms) if n in det_types]
         stat_ix = [i for i, n in enumerate(norms) if n in stat_types]
         if det_ix and stat_ix and max(det_ix) > min(stat_ix):
@@ -396,6 +396,14 @@ class FeatureGrid:
             elif ntype == "to_sin":
                 feature = xr.apply_ufunc(np.sin, feature, dask="allowed")
                 steps.append({"step": "to_sin"})
+            elif ntype == "per_area":
+                # -- a spatial kernel normalized in pixel units deposits the same
+                # -- total per event whatever the cell size, so the raw layer is
+                # -- mass per cell and rescales with resolution. Dividing by cell
+                # -- area gives a density that means the same on every grid.
+                area_km2 = (self.cfg.resolution / 1000.0) ** 2
+                feature = feature / area_km2
+                steps.append({"step": "per_area", "cell_km2": float(area_km2)})
 
         return feature, steps
 

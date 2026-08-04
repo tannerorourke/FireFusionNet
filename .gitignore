@@ -20,6 +20,7 @@ runs/**
 
 # Compilation
 __pycache__/
+*.egg-info/
 .ipynb_checkpoints
 
 # Environment
@@ -27,3 +28,5 @@ __pycache__/
 .env
 .venv
 .vscode
+# Dependency lock (requirements.txt is the install surface)
+uv.lock

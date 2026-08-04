@@ -4,42 +4,41 @@ version = "1.2.0"
 description = "Spatio-temporal ConvFormer for wildfire ignition & cause prediction over Washington State"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-    "torch==2.2.2",
-    "numpy>=1.26,<1.27",
-    "pandas>=2.2,<2.3",
-    "scipy>=1.12,<1.13",
+    "torch>=2.2.2",
+    "numpy",
+    "pandas",
+    "scipy",
     "scikit-learn",
     "matplotlib",
     "tqdm",
-    # geospatial: wheels bundle their own GDAL/PROJ/GEOS, so no system libs.
-    # The bundled GDAL carries HDF5 but not HDF4, so reading raw MODIS granules
-    # (HDF-EOS2) additionally needs `conda install -c conda-forge libgdal-hdf4`.
-    # That applies to building a dataset locally; consumers of a built cube --
-    # cloud training included -- read zarr and need nothing extra.
-    "rasterio>=1.4.3,<1.5",
-    "rioxarray>=0.15,<0.16",
-    "xarray>=2024.3,<2024.4",
-    "geopandas>=0.14,<0.15",
+    "rasterio",
+    "pyhdf",
+    "rioxarray",
+    "geopandas",
+    "shapely",
+    "pyproj",
     "pyogrio",
     "fiona",
-    "shapely>=2.0,<2.1",
-    "pyproj>=3.6,<3.7",
-    # array IO backends used implicitly by xarray (.nc reads, zarr splits)
-    "netcdf4",
-    "h5netcdf",
-    "zarr>=2,<3",
+    "xarray",
+    "zarr<3",
     "numcodecs",
     "dask",
+    "netcdf4",
+    "h5netcdf",
     "earthaccess",
-    "boto3",
-    # raw-weather ingest: PRISM web service (HTTP) and AORC anonymous S3 zarr
     "requests",
     "s3fs",
-    # training telemetry (per-epoch scalars + console log mirror)
+    "boto3",
     "tensorboard",
 ]
 
-[tool.uv]
-# The repo is run as modules (`python -m fire_fusion.<...>`), not installed as a
-# distribution, so uv provisions dependencies without building the package.
-package = false
+# Version bounds live in requirements.txt, which is the install surface for both
+# local and cloud. The bounds here stay loose so the two never contradict.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fire_fusion*"]
