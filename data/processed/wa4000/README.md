@@ -73,14 +73,15 @@ Each split is a zarr store holding `X` with shape `(time, channel, y, x)` in `fl
 | Name | dtype | Meaning |
 | --- | --- | --- |
 | `ign_next` | int8 | 1 if a clear cell burns within the next 7 days |
-| `ign_next_cause` | int8 | cause id of the earliest such ignition, else -1 |
+| `ign_next_cause` | int8  | cause id of the earliest such ignition, else -1 |
 
 | ID | Cause | Train positives |
 | --- | --- | --- |
 | 0 | `NATURAL_LIGHTNING` | 14917 |
 | 1 | `HUMAN` | 5781 |
-| 2 | `INDUSTRIAL` | 486 |
-| 3 | `DEBRIS` | 294 |
+| 2 | `INDUSTRIAL` (includes debris) | 780 |
+
+Note: `dataset.zarr` carries four classes. The splits `compile` debris into industrial together, since both are a few hundred cases vs. lightning and human causes which are the overwhelming majority of cases. Regroup them by re-running compile against the published cube; `n_cause_classes` in each manifest is authoritative for the store beside it.
 
 ## Masks
 
