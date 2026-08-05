@@ -46,8 +46,8 @@
       "select_by": "val_ign"
     }
   },
-  "wa2000-focus": {
-    "dataset": "wa2000",
+  "wa4000-d96": {
+    "dataset": "wa4000",
     "model": {
       "embed_dim": 96,
       "encoder_depth": 1,
@@ -75,99 +75,6 @@
     },
     "training": {
       "seed": 1,
-      "batch_size": 2,
-      "max_workers": 2,
-      "epochs": [
-        2,
-        18,
-        6
-      ],
-      "min_lr": 1e-06,
-      "base_lr": 0.0005,
-      "weight_decay": 0.0001,
-      "grad_clip": 1.0,
-      "crop_size": 128,
-      "neg_keep_rate": 0.05,
-      "alpha_ign": 1.0,
-      "alpha_cause": "auto",
-      "select_by": "val_ign"
-    }
-  },
-  "wa2000-s1": {
-    "dataset": "wa2000",
-    "model": {
-      "embed_dim": 96,
-      "encoder_depth": 1,
-      "win_spatial_mixing": {
-        "num_heads": 4,
-        "window_size": 2,
-        "dropout": 0.1
-      },
-      "channel_mixing": {
-        "num_heads": 4,
-        "d_model": 32,
-        "mlp_ratio": 2.0,
-        "dropout": 0.1,
-        "chunk_size": 4096
-      },
-      "temporal_mixing": {
-        "num_heads": 4,
-        "mlp_ratio": 2.0,
-        "dropout": 0.1
-      },
-      "static_film": {
-        "width": 32
-      },
-      "modality_dropout": 0.15
-    },
-    "training": {
-      "seed": 1,
-      "batch_size": 12,
-      "epochs": [
-        5,
-        60,
-        10
-      ],
-      "min_lr": 1e-06,
-      "base_lr": 0.001,
-      "weight_decay": 0.0001,
-      "grad_clip": 1.0,
-      "crop_size": null,
-      "neg_keep_rate": 0.05,
-      "alpha_ign": 1.0,
-      "alpha_cause": "auto",
-      "select_by": "val_ign"
-    }
-  },
-  "wa2000-s2": {
-    "dataset": "wa2000",
-    "model": {
-      "embed_dim": 96,
-      "encoder_depth": 1,
-      "win_spatial_mixing": {
-        "num_heads": 4,
-        "window_size": 2,
-        "dropout": 0.1
-      },
-      "channel_mixing": {
-        "num_heads": 4,
-        "d_model": 32,
-        "mlp_ratio": 2.0,
-        "dropout": 0.1,
-        "chunk_size": 4096
-      },
-      "temporal_mixing": {
-        "num_heads": 4,
-        "mlp_ratio": 2.0,
-        "dropout": 0.1
-      },
-      "static_film": {
-        "width": 32
-      },
-      "modality_dropout": 0.15
-    },
-    "training": {
-      "seed": 2,
       "batch_size": 12,
       "epochs": [
         5,
@@ -188,7 +95,7 @@
   "wa4000-s1": {
     "dataset": "wa4000",
     "model": {
-      "embed_dim": 96,
+      "embed_dim": 192,
       "encoder_depth": 1,
       "win_spatial_mixing": {
         "num_heads": 4,
@@ -234,7 +141,99 @@
   "wa4000-s2": {
     "dataset": "wa4000",
     "model": {
-      "embed_dim": 96,
+      "embed_dim": 192,
+      "encoder_depth": 1,
+      "win_spatial_mixing": {
+        "num_heads": 4,
+        "window_size": 2,
+        "dropout": 0.1
+      },
+      "channel_mixing": {
+        "num_heads": 4,
+        "d_model": 32,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1,
+        "chunk_size": 4096
+      },
+      "temporal_mixing": {
+        "num_heads": 4,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1
+      },
+      "static_film": {
+        "width": 32
+      },
+      "modality_dropout": 0.15
+    },
+    "training": {
+      "seed": 2,
+      "batch_size": 12,
+      "epochs": [
+        5,
+        60,
+        10
+      ],
+      "min_lr": 1e-06,
+      "base_lr": 0.001,
+      "weight_decay": 0.0001,
+      "grad_clip": 1.0,
+      "crop_size": null,
+      "neg_keep_rate": 0.05,
+      "alpha_ign": 1.0,
+      "alpha_cause": "auto",
+      "select_by": "val_ign"
+    }
+  },
+  "wa2000-s1": {
+    "dataset": "wa2000",
+    "model": {
+      "embed_dim": 192,
+      "encoder_depth": 1,
+      "win_spatial_mixing": {
+        "num_heads": 4,
+        "window_size": 2,
+        "dropout": 0.1
+      },
+      "channel_mixing": {
+        "num_heads": 4,
+        "d_model": 32,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1,
+        "chunk_size": 4096
+      },
+      "temporal_mixing": {
+        "num_heads": 4,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1
+      },
+      "static_film": {
+        "width": 32
+      },
+      "modality_dropout": 0.15
+    },
+    "training": {
+      "seed": 1,
+      "batch_size": 12,
+      "epochs": [
+        5,
+        60,
+        10
+      ],
+      "min_lr": 1e-06,
+      "base_lr": 0.001,
+      "weight_decay": 0.0001,
+      "grad_clip": 1.0,
+      "crop_size": null,
+      "neg_keep_rate": 0.05,
+      "alpha_ign": 1.0,
+      "alpha_cause": "auto",
+      "select_by": "val_ign"
+    }
+  },
+  "wa2000-s2": {
+    "dataset": "wa2000",
+    "model": {
+      "embed_dim": 192,
       "encoder_depth": 1,
       "win_spatial_mixing": {
         "num_heads": 4,
@@ -280,7 +279,7 @@
   "wa1000-s1": {
     "dataset": "wa1000",
     "model": {
-      "embed_dim": 96,
+      "embed_dim": 192,
       "encoder_depth": 2,
       "win_spatial_mixing": {
         "num_heads": 4,
@@ -326,7 +325,7 @@
   "wa1000-s2": {
     "dataset": "wa1000",
     "model": {
-      "embed_dim": 96,
+      "embed_dim": 192,
       "encoder_depth": 2,
       "win_spatial_mixing": {
         "num_heads": 4,
@@ -369,11 +368,11 @@
       "select_by": "val_ign"
     }
   },
-  "cascades250-s1": {
-    "dataset": "cascades250",
+  "cascades500-s1": {
+    "dataset": "cascades500",
     "model": {
-      "embed_dim": 96,
-      "encoder_depth": 4,
+      "embed_dim": 192,
+      "encoder_depth": 3,
       "win_spatial_mixing": {
         "num_heads": 4,
         "window_size": 2,
@@ -415,11 +414,11 @@
       "select_by": "val_ign"
     }
   },
-  "cascades250-s2": {
-    "dataset": "cascades250",
+  "cascades500-s2": {
+    "dataset": "cascades500",
     "model": {
-      "embed_dim": 96,
-      "encoder_depth": 4,
+      "embed_dim": 192,
+      "encoder_depth": 3,
       "win_spatial_mixing": {
         "num_heads": 4,
         "window_size": 2,
@@ -444,6 +443,52 @@
     },
     "training": {
       "seed": 2,
+      "batch_size": 2,
+      "epochs": [
+        5,
+        60,
+        10
+      ],
+      "min_lr": 1e-06,
+      "base_lr": 0.0005,
+      "weight_decay": 0.0001,
+      "grad_clip": 1.0,
+      "crop_size": null,
+      "neg_keep_rate": 0.05,
+      "alpha_ign": 1.0,
+      "alpha_cause": "auto",
+      "select_by": "val_ign"
+    }
+  },
+  "cascades500-optimal": {
+    "dataset": "cascades500",
+    "model": {
+      "embed_dim": 256,
+      "encoder_depth": 3,
+      "win_spatial_mixing": {
+        "num_heads": 4,
+        "window_size": 2,
+        "dropout": 0.1
+      },
+      "channel_mixing": {
+        "num_heads": 4,
+        "d_model": 32,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1,
+        "chunk_size": 4096
+      },
+      "temporal_mixing": {
+        "num_heads": 4,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1
+      },
+      "static_film": {
+        "width": 32
+      },
+      "modality_dropout": 0.15
+    },
+    "training": {
+      "seed": 1,
       "batch_size": 2,
       "epochs": [
         5,

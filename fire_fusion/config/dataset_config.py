@@ -1,12 +1,12 @@
-# Named dataset configurations, one per directory under data/processed/<name>/.
+# Dataset configurations, one per directory under data/processed/<name>/.
 #
 #   extract  raw sources  -> cube.zarr
 #   publish  cube.zarr    -> dataset.zarr
 #   compile  dataset.zarr -> {train,eval,test}.zarr + manifest.json
 #
-# dataset.zarr is the redistributable artifact and holds only deterministic
-# functions of the raw sources. Transforms with data-estimated parameters live
-# in compile, where the split years below apply.
+# dataset.zarr is the redistributable artifact: deterministic functions of the
+# raw sources only. Data-estimated transforms live in compile, where the split
+# years below apply.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -88,12 +88,12 @@ DATASET_CONFIGS: Dict[str, DatasetConfig] = {
             "wa1000", 1000.0, (45.5, 49.0), (-122.5, -117.0),
             x_time_chunk=16, spatial_splits=2, season_months=(5, 10),
         ),
-        # Eastern Cascades, crest through east slope (576x576, a 144km square).
+        # Eastern Cascades, crest through Okanogan Highlands (544x544, a 272km square).
         # Bounds are picked so the natural extent is already a multiple of the
-        # depth-4 stride-window product: it partitions evenly and needs no crop.
+        # depth-3 stride-window product: it partitions evenly and needs no crop.
         # North clamps to the 49th parallel; US sources stop at the border.
         DatasetConfig(
-            "cascades250", 250.0, (47.744, 49.0), (-121.6, -119.714),
+            "cascades500", 500.0, (46.642, 49.0), (-121.85, -118.349),
             x_time_chunk=16, spatial_splits=3, season_months=(5, 10),
         ),
     ]

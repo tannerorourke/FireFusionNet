@@ -64,7 +64,7 @@ CAUSE_RAW_MAP = {
         # text
         "campfire", "camping",
         "arson", "incendiary", "firearms/weapons",
-        "children",
+        "children", "smoking",
         "human",
         "miscellaneous",
         "other causes",

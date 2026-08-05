@@ -1,7 +1,7 @@
 """Restrict a metric to one tier's ground footprint on any other tier's grid.
 
 Cross-resolution comparison is only meaningful over identical ground, and the
-tiers do not share any. `cascades250` covers a corridor whose ignition rate is
+tiers do not share any. `cascades500` covers a corridor whose ignition rate is
 roughly three times the state average, so a statewide model scored statewide and
 a corridor model scored on the corridor are not answering the same question, and
 the corridor will look better for a reason unrelated to resolution.
@@ -9,7 +9,7 @@ the corridor will look better for a reason unrelated to resolution.
 Every claim that compares resolutions should pass the reference tier's footprint
 into scoring. Claims about a single tier on its own extent should not.
 
-  python -m fire_fusion.analysis.footprint --reference cascades250
+  python -m fire_fusion.analysis.footprint --reference cascades500
 """
 import argparse
 from typing import Tuple
@@ -69,7 +69,7 @@ def summarize(tiers, reference: str, store: str) -> None:
 
 def main():
     ap = argparse.ArgumentParser(description="Common-footprint accounting across resolution tiers")
-    ap.add_argument("--reference", default="cascades250", choices=sorted(DATASET_CONFIGS),
+    ap.add_argument("--reference", default="cascades500", choices=sorted(DATASET_CONFIGS),
                     help="tier whose bounds define the shared footprint")
     ap.add_argument("--tiers", nargs="+", default=sorted(DATASET_CONFIGS))
     ap.add_argument("--store", default="dataset.zarr",
