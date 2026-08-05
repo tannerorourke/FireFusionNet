@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 import math
 import torch
 import torch.nn as nn
@@ -81,6 +81,63 @@ class PlattScaler(nn.Module):
         return self
 
 
+class CauseVectorScaler(nn.Module):
+    """
+    Per-class affine logit calibration for the softmax cause head:
+    z'_c = a_c * z_c + b_c.
+
+    A head trained with per-class weights w_c converges, at the population
+    optimum, to q_c proportional to w_c * p_c: each class weight lands as an
+    additive log(w_c) tilt on that class's logit. init_b = -log(w_c) starts
+    the fit exactly on the analytic inverse of that tilt, so the unweighted
+    fit that follows sees the true class balance rather than the reweighting.
+
+    a is carried as exp(log_a) so every class's scale stays positive.
+    """
+    def __init__(self, n_classes: int, init_b: Sequence[float] | None = None):
+        super().__init__()
+        b0 = torch.tensor(init_b, dtype=torch.float32) if init_b is not None else torch.zeros(n_classes)
+        self.log_a = nn.Parameter(torch.zeros(n_classes))  # a = 1
+        self.b = nn.Parameter(b0)                          # analytic prior offset
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        return torch.exp(self.log_a) * logits + self.b
+
+    def probs(self, logits: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(self.forward(logits), dim=-1)
+
+    @torch.enable_grad()
+    def fit(self, logits: torch.Tensor, labels: torch.Tensor, max_iter: int = 100):
+        """ Fit (a, b) by minimizing unweighted cross-entropy on held-out cells.
+
+        Unweighted is the point: the reliability we want is P(cause | score),
+        so the fit must see the true class balance rather than the training-
+        time reweighting that caused the miscalibration.
+        """
+        z = logits.detach().float()
+        y = labels.detach().long()
+
+        opt = torch.optim.LBFGS(self.parameters(), lr=0.1, max_iter=max_iter)
+
+        def closure():
+            opt.zero_grad()
+            loss = nn.functional.cross_entropy(self.forward(z), y)
+            loss.backward()
+            return loss
+
+        opt.step(closure)
+        return self
+
+    def state(self) -> Dict[str, List[float]]:
+        return {"a": torch.exp(self.log_a).detach().tolist(), "b": self.b.detach().tolist()}
+
+    def load_state(self, params: Dict[str, List[float]]):
+        with torch.no_grad():
+            self.log_a.copy_(torch.log(torch.tensor(params["a"], dtype=torch.float32)))
+            self.b.copy_(torch.tensor(params["b"], dtype=torch.float32))
+        return self
+
+
 @torch.no_grad()
 def expected_calibration_error(
     probs: torch.Tensor, labels: torch.Tensor, num_bins: int = 15
@@ -136,14 +193,10 @@ class Accuracy(Metric):
         self.ep_correct = 0
         self.ep_total = 0
 
+    # -- preds/labels: (b,) or (b, h, w) class indices; mask optionally
+    #    selects the cells to score.
     @torch.no_grad()
     def add(self, preds: torch.Tensor, labels: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        """ Update accuracy and ground truth labels
-        Args:
-            preds (torch.LongTensor): (b,) or (b, h, w) tensor with class predictions
-            labels (torch.LongTensor): (b,) or (b, h, w) tensor with ground truth class labels
-            mask (torch.BoolTensor): optional (b, h, w) selection of the cells to score
-        """
         if mask is not None:
             preds = preds[mask]
             labels = labels[mask]
@@ -180,10 +233,6 @@ class ConfusionMatrix(Metric):
     """
 
     def __init__(self, num_classes: int = 3):
-        """
-        Args:
-            num_classes: number of label classes
-        """
         super().__init__()
         self.num_classes = num_classes
         self.record: List[Dict] = []
@@ -411,20 +460,74 @@ class BinaryAUC(Metric):
 
 
 
+class MeanIgnorance(Metric):
+    """
+    Masked mean binary ignorance (log score) in bits, for a single-logit head.
+
+    Ignorance is BCE-with-logits converted from nats to bits: the number of
+    bits the model needed to be told, on average, to learn the true label --
+    zero for a certain correct call, unbounded for a confident wrong one.
+    Accumulated as a running sum and count, so memory is O(1) per epoch
+    rather than an epoch of per-cell scores.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.sum_bits = 0.0
+        self.n_cells = 0
+
+    def reset(self) -> None:
+        self.sum_bits = 0.0
+        self.n_cells = 0
+
+    @torch.no_grad()
+    def add(self, logits: torch.Tensor, labels: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        """
+        Args:
+            logits: (B, 1, H, W) or (B, H, W) raw scores for the positive class
+            labels: (B, H, W) ground truth in {0, 1}
+            mask:   optional (B, H, W) selection of the cells to score
+        """
+        if logits.dim() == 4 and logits.size(1) == 1:
+            logits = logits.squeeze(1)
+
+        if mask is not None:
+            logits = logits[mask]
+            labels = labels[mask]
+        if labels.numel() == 0:
+            return
+
+        z = logits.detach().float().flatten()
+        y = labels.detach().float().flatten()
+        bce = nn.functional.binary_cross_entropy_with_logits(z, y, reduction="none")
+        self.sum_bits += float((bce / math.log(2)).sum().item())
+        self.n_cells += y.numel()
+
+    def compute_step(self) -> Dict[str, float]:
+        ign = self.sum_bits / self.n_cells if self.n_cells > 0 else float("nan")
+        scores = {"ign_bits": ign, "n_cells": self.n_cells}
+        self.record.append(scores)
+        self.reset()
+        return scores
+
+    def get_history(self) -> List[Dict]:
+        return self.record
+
+
+
 class MetricsManager:
     def __init__(
         self,
         num_classes: Tuple = (2,),
-        select_by: Literal["pr_auc", "val_loss"] = "pr_auc",
+        select_by: Literal["pr_auc", "val_loss", "val_ign"] = "pr_auc",
     ):
         """
-        num_classes: Tuple with number of classes per prediction head
-            e.g. one binary classifier + separate 4-class head -> (2, 4)
+        num_classes: per-head class counts, e.g. (2, 4) for binary + 4-class heads.
         select_by: what "best epoch" and early stopping key off.
             "pr_auc"   - masked PR-AUC of the ignition head (maximized)
-            "val_loss" - total validation loss (minimized), which sums both
-                         heads and so mixes the sparse cause term into the
-                         choice of checkpoint
+            "val_loss" - total validation loss (minimized); mixes in the cause term
+            "val_ign"  - masked mean eval ignorance in bits (minimized); nan
+                         (no scored cells) is never selected
         """
         assert num_classes and num_classes[0] == 2, \
             "head 0 is the binary ignition head; its ranking scores assume a single logit"
@@ -441,6 +544,9 @@ class MetricsManager:
 
         # Ranking scores for the binary ignition head
         self.val_auc = BinaryAUC()
+
+        # Masked mean eval ignorance (bits) for the binary ignition head
+        self.val_ign = MeanIgnorance()
 
         # Loss history: (num_loss_terms, num_epochs)
         self.trn_losses: Optional[np.ndarray] = None
@@ -463,20 +569,16 @@ class MetricsManager:
             # an epoch whose eval split carried no positives scores nan and
             # cannot be ranked against anything
             return bool(np.isfinite(score)) and score > self.best["score"]
+        if self.select_by == "val_ign":
+            # an epoch with no scored cells scores nan and cannot be ranked
+            return bool(np.isfinite(score)) and score < self.best["score"]
         return score < self.best["score"]
 
+    # -- multi-class logits (B, C, ...) argmax over C; binary (B, 1, ...)
+    #    threshold at 0. A channel count contradicting n_classes is a wiring
+    #    error; this raises immediately instead of colliding downstream.
     @staticmethod
     def _logits_to_preds(logits: torch.Tensor, n_classes: int) -> torch.Tensor:
-        """
-        Convert a head's logits to class indices.
-        Handles:
-          - multi-class logits (B, C, ...) -> argmax over C
-          - binary logits (B, 1, ...)      -> threshold at 0
-
-        A head whose channel count contradicts its class count is a wiring
-        error, and silently reading logits as indices hides it until the
-        shapes collide somewhere less obvious.
-        """
         if logits.dim() > 1 and logits.size(1) == n_classes and n_classes > 1:
             return torch.argmax(logits, dim=1)
 
@@ -488,9 +590,9 @@ class MetricsManager:
             f"expected (B, {n_classes}, ...), or (B, 1, ...) for a binary head"
         )
 
+    # -- loaders emit (B, H, W) for the window's final day; tolerate (B, T, H, W)
     @staticmethod
     def _last_day(labels: torch.Tensor) -> torch.Tensor:
-        """ Loaders emit (B, H, W) for the window's final day; tolerate (B, T, H, W). """
         return labels[:, -1] if labels.dim() == 4 else labels
 
     def add(
@@ -529,16 +631,15 @@ class MetricsManager:
             cm.add(preds_i, labels_i, mask_for(i))
 
         self.val_auc.add(logits[0], self._last_day(golds[0]).long(), mask_for(0))
+        self.val_ign.add(logits[0], self._last_day(golds[0]).long(), mask_for(0))
 
+    # -- losses: e.g. [total, ign, cause] for the epoch; accumulated as
+    #    columns, giving (num_loss_terms, num_epochs).
     def add_epoch_totals(
         self,
         type: Literal["train", "eval"],
         losses: np.ndarray,
     ):
-        """
-        losses: 1D array of loss terms for this epoch, e.g. [total, ign, cause]
-        Stored as columns in (num_loss_terms, num_epochs).
-        """
         new_col = np.asarray(losses).reshape(-1, 1)
 
         if type == "train":
@@ -572,13 +673,19 @@ class MetricsManager:
         for cm in self.val_cm[1:]:
             cm.compute_step()
 
+        # finalized every epoch regardless of select_by, so the report line
+        # and TensorBoard scalar always carry it
+        ign_bits = self.val_ign.compute_step()["ign_bits"]
+
         trn_last = self.trn_losses[:, -1]
         val_last = self.val_losses[:, -1]
 
         # the ignition head's ranking quality is the claim under test; total
         # validation loss also carries the sparse, high-variance cause term
         score = float(
-            ign_scores["pr_auc"] if self.select_by == "pr_auc" else val_last[0]
+            ign_scores["pr_auc"] if self.select_by == "pr_auc"
+            else ign_bits if self.select_by == "val_ign"
+            else val_last[0]
         )
 
         trn_total, trn_ign, trn_cause = trn_last[:3]
@@ -596,7 +703,8 @@ class MetricsManager:
             f"PR-AUC: {ign_scores['pr_auc']:.5f}, "
             f"ROC-AUC: {ign_scores['roc_auc']:.4f}, "
             f"F1: {ign_scores['f1']:.4f}, "
-            f"recall: {ign_scores['recall']:.4f}\n"
+            f"recall: {ign_scores['recall']:.4f}, "
+            f"ignorance (bits): {ign_bits:.4f}\n"
             f"         SCORE ({self.select_by}): {score:.5f}"
         )
         print(report)
@@ -609,6 +717,7 @@ class MetricsManager:
             "loss/eval_cause": float(val_cause),
             "ign/pr_auc": float(ign_scores["pr_auc"]), "ign/roc_auc": float(ign_scores["roc_auc"]),
             "ign/f1": float(ign_scores["f1"]), "ign/recall": float(ign_scores["recall"]),
+            "ign/val_bits": float(ign_bits),
             "score": float(score),
         }
 

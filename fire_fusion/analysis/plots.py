@@ -100,16 +100,12 @@ def plot_rates_per_epoch(epochs: List, rates: Tuple, save=True, save_path: str |
 
 
 def precision_recall_history(record: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
-    """ Given confusion-matrix record entries, return macro precision and recall for each epoch """
-    
     precisions = np.array([r["precision"] for r in record], dtype=float)
     recalls = np.array([r["recall"] for r in record], dtype=float)
     return precisions, recalls
 
 
 def auc_history(record: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
-    """ Extract PR-AUC and ROC-AUC per epoch from record (if present) """
-    
     pr_aucs = [r["pr_auc"] for r in record if r.get("pr_auc") is not None]
     roc_aucs = [r["roc_auc"] for r in record if r.get("roc_auc") is not None]
     return np.asarray(pr_aucs, dtype=float), np.asarray(roc_aucs, dtype=float)
@@ -119,8 +115,6 @@ def auc_vs_f1_history(
     record: List[Dict],
     which_auc: str = "roc_auc",  # or "pr_auc"
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """ Return (AUC, F1) pairs per epoch for plotting """
-    
     aucs = []
     f1s = []
     for r in record:
@@ -192,7 +186,7 @@ def plot_XY_grid(
         land_mask = np.array(land_mask).astype(bool)
         data = np.ma.masked_where(~land_mask, data)
 
-    cmap = plt.cm.get_cmap("coolwarm").copy()
+    cmap = matplotlib.colormaps["coolwarm"].copy()
     cmap.set_bad(color="black")
 
     if vmin is None:

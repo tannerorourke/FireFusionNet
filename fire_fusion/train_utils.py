@@ -11,7 +11,7 @@ from .config.path_config import MODEL_SAVE_DIR
 
 
 def estimate_model_size_mb(model: torch.nn.Module) -> float:
-    """ Naive way to estimate model size """
+    # -- 4 bytes per fp32 parameter; buffers and optimizer state not counted
     return sum(p.numel() for p in model.parameters()) * 4 / 1024 / 1024
 
 
@@ -24,15 +24,9 @@ def set_global_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def checkpoint_name(experiment: str, stage: str) -> str:
-    """ Checkpoint name for one (experiment, stage) pair.
-
-    Two runs differ only by which experiment and stage produced them, so both
-    belong in the name: a shared `main_model.th` would leave each experiment
-    overwriting the weights of the one before it.
-    """
-    kind = "main" if stage == "pretrain" else "specialized"
-    return f"{experiment}_{kind}_model"
+# -- the name carries the experiment, so two runs never overwrite each other
+def checkpoint_name(experiment: str) -> str:
+    return f"{experiment}_model"
 
 
 def get_device_config(maximum: int | None = None, utilization: float | None = 0.75):
@@ -54,16 +48,13 @@ def get_device_config(maximum: int | None = None, utilization: float | None = 0.
 
 def save_model(
     model: torch.nn.Module,
-    name_base: str = "wf_risk_model",
+    name_base: str = "model",
     overwrite: bool = False,
 ) -> str:
-    """ Use this function to save your model in train.py
-
-    overwrite: write to `<name_base>.th` instead of taking the next free
-    `<name_base>_<i>.th`, for checkpoints that are re-saved as a run improves.
-    """
     MODEL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # -- overwrite takes the fixed `<name_base>.th`, for a checkpoint re-saved as
+    # -- a run improves; otherwise the next free `<name_base>_<i>.th`
     if overwrite:
         output_path = MODEL_SAVE_DIR / f"{name_base}.th"
     else:
@@ -81,18 +72,9 @@ def export_to_b2(
     *paths: str | Path,
     prefix: str = "runs",
 ) -> bool:
-    """ Upload finished run artifacts to Backblaze B2 under `<prefix>/...`.
-
-    A file uploads to `<prefix>/<filename>`; a directory (e.g. a TensorBoard run)
-    uploads recursively, each file keyed by its path relative to the directory
-    root, so its contents land directly under the prefix. Callers pass a per-run
-    prefix, letting the whole run be reconstructed after the cloud box is torn down.
-
-    Credentials come from the B2_* environment (see dataset.fetch_cloud). Reports
-    and returns False rather than raising: this runs after the weights are already
-    on local disk, so a credentials or network problem should not take down an
-    otherwise complete run.
-    """
+    # -- a file lands at `<prefix>/<filename>`, a directory recursively under its
+    # -- own relative paths, so a per-run prefix reconstructs the whole run once
+    # -- the cloud box is torn down. Credentials come from the B2_* environment.
     try:
         from .dataset.fetch_cloud import B2Store
         store = B2Store()
@@ -110,6 +92,8 @@ def export_to_b2(
                 store.put_file(path, f"{prefix}/{path.name}", overwrite=True)
         return True
     except Exception as e:
+        # -- the weights are already on local disk by now, so a credentials or
+        # -- network failure should not take down an otherwise complete run
         print(f"[export_to_b2] upload failed ({type(e).__name__}): {e}")
         return False
 
@@ -120,16 +104,10 @@ def load_model(
     map_location=None,
     strict: bool = True,
 ):
-    """ Restore weights written by save_model into an existing model.
-
-    A bare name (no directory component) is resolved against MODEL_SAVE_DIR,
-    mirroring save_model's output layout, so `load_model(m, "main_model.th")`
-    pairs with `save_model(m, name_base="main_model", overwrite=True)`.
-
-    strict=False tolerates a checkpoint that only covers part of the model
-    (e.g. a backbone loaded into a model with freshly initialized heads); the
-    returned value lists whatever keys were missing or unexpected.
-    """
+    # -- a bare name resolves under MODEL_SAVE_DIR, mirroring save_model's layout.
+    # -- strict=False tolerates a checkpoint covering part of the model, such as a
+    # -- backbone loaded into freshly initialized heads, and the return value lists
+    # -- whichever keys were missing or unexpected.
     p = Path(path)
     if p.parent == Path("."):
         p = MODEL_SAVE_DIR / p
@@ -138,12 +116,9 @@ def load_model(
     return model.load_state_dict(state, strict=strict)
 
 
-def save_calibration(params: dict, name_base: str = "specialized_model") -> str:
-    """ Write a calibrator sidecar next to its `<name_base>.th` checkpoint.
-
-    The probabilities a checkpoint produces depend on both its weights and the
-    fitted calibration, so the two travel together under a shared name.
-    """
+def save_calibration(params: dict, name_base: str = "model") -> str:
+    # -- the probabilities a checkpoint produces depend on both its weights and the
+    # -- fitted calibration, so the sidecar travels under the checkpoint's name
     MODEL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
     output_path = MODEL_SAVE_DIR / f"{name_base}.calib.json"
     with open(output_path, "w") as f:
@@ -151,13 +126,10 @@ def save_calibration(params: dict, name_base: str = "specialized_model") -> str:
     return str(output_path)
 
 
-def load_calibration(name_base: str = "specialized_model") -> dict | None:
-    """ Load a calibrator sidecar by checkpoint name, or None if absent.
-
-    A bare `<name_base>` (no directory) resolves against MODEL_SAVE_DIR; a path
-    ending in `.calib.json` is read as given. Absent means "no fit available",
-    which the predictor answers with the analytic prior correction.
-    """
+def load_calibration(name_base: str = "model") -> dict | None:
+    # -- a bare name resolves under MODEL_SAVE_DIR; a path ending in .calib.json is
+    # -- read as given. Absent means no fit available, which the predictor answers
+    # -- with the analytic prior correction.
     p = Path(name_base)
     if p.suffix != ".json":
         p = MODEL_SAVE_DIR / f"{p.name}.calib.json"

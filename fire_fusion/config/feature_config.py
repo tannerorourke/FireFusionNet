@@ -1,10 +1,29 @@
-# Who wants to deal with tuples in JSON, anyways??
 from dataclasses import dataclass
 import numpy as np
 from rasterio.enums import Resampling
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from xarray.core.types import InterpOptions
 
+"""
+A clear cell is positive if it burns within this IGN_HORIZON_DAYS days.
+- A single day leaves the positive class much too sparse to supervise; a week 
+  still reads as a short-range forecast.
+- The causal label and validity mask naturally pick this up downstream.
+"""
+IGN_HORIZON_DAYS = 7
+
+
+"""
+Every channel in the cube belongs to one CHANNEL_GROUPS group. The model conditions on these: 
+- STATIC and QUASI_STATIC carry no per-day signal and steer the dynamic path
+- MET (meteorology) and STATE evolve daily
+- SCALAR is the spatially constant date term
+
+CAUSAL_CLASSES determine output shape of prediction head
+- DEBRIS and INDUSTRIAL are merged into INDUSTRIAL at compile time, since DEBRIS is a few
+  hundred labelled cell-days vs five-figs for lightning.
+"""
+CHANNEL_GROUPS = ("STATIC", "QUASI_STATIC", "MET", "STATE", "SCALAR")
 
 CAUSAL_CLASSES = [
     "NATURAL_LIGHTNING",
@@ -13,11 +32,7 @@ CAUSAL_CLASSES = [
     "DEBRIS"
 ]
 
-# Classes folded together when the splits are written. Debris is a few hundred
-# labelled cell-days vs five-figs for lightning.
-# The cube keeps all four, reversing this is a recompile.
 CAUSE_MERGE = {"DEBRIS": "INDUSTRIAL"}
-
 
 def compiled_cause_classes() -> List[str]:
     # -- CAUSAL_CLASSES after merging, in output order; index is the label value
@@ -33,12 +48,6 @@ def cause_index_remap() -> Dict[int, int]:
     # -- extracted class index -> compiled class index
     compiled = compiled_cause_classes()
     return {i: compiled.index(CAUSE_MERGE.get(c, c)) for i, c in enumerate(CAUSAL_CLASSES)}
-
-# Ignition horizon: a clear cell is positive if it burns within this many days,
-# and the cause label and its validity mask read the same forward window. A day
-# leaves the positive class too sparse to supervise; a week still reads as a
-# short-range forecast.
-IGN_HORIZON_DAYS = 7
 
 CAUSE_RAW_MAP = {
     "NATURAL_LIGHTNING": [
@@ -82,14 +91,10 @@ CAUSE_RAW_MAP = {
     ],
 }
 
-WUI_CLASSES = {
-    "UNINHABITED_WATER",
-    "RURAL",
-    "NOWUI_URBAN",
-    "WUI_INTERMIX",
-    "WUI_INTERFACE"
-}
-
+"""
+Scaling down the WUI classes to 5 classes provides a more consistent
+and interpretable signal.
+"""
 WUI_CLASS_MAP: dict[str, int] = {
     # uninhabited
     "Uninhabited_Veg": 0,
@@ -112,6 +117,18 @@ WUI_CLASS_MAP: dict[str, int] = {
     "High_Dens_Interface": 4,
 }
 
+# purelyy for readability
+WUI_CLASSES = {
+    "UNINHABITED_WATER",
+    "RURAL",
+    "NOWUI_URBAN",
+    "WUI_INTERMIX",
+    "WUI_INTERFACE"
+}
+
+"""
+NLCD land cover classes
+"""
 LAND_COVER_RAW_MAP = {
     0: [11], # water
     1: [12], # snow
@@ -127,6 +144,7 @@ LAND_COVER_RAW_MAP = {
 class Feature:
     name: str = ""
     key: Optional[str] = ""                         # unique key to access data
+    group: Optional[str] = None                     # CHANNEL_GROUPS membership; untagged never reaches the cube
     clip: Optional[Tuple[float, float]] = None
     resampling: Optional[Resampling] = None         # strategy for filling missing pixels in feature grid
     time_interp: Optional[Tuple[str, InterpOptions]] = None # "time" = broadcast over time D, "existing" = fill missing
@@ -167,11 +185,29 @@ def get_masks():
         [f for feats in base_feat_config().values() for f in feats if f.is_mask==True]
     )
 
+def channel_group_indices(names: Sequence[str]) -> Dict[str, List[int]]:
+    """ Group name -> positions of that group's channels in `names`. """
+    tagged: Dict[str, str] = {}
+    for f in [f for feats in base_feat_config().values() for f in feats] + drv_feat_config():
+        if f.group:
+            # -- an expanded feature never reaches the cube under its own name
+            for n in (f.expand_names or [f.name]):
+                tagged[n] = f.group
+
+    out: Dict[str, List[int]] = {}
+    for i, n in enumerate(names):
+        if n not in tagged:
+            raise KeyError(f"channel '{n}' carries no feature group")
+        out.setdefault(tagged[n], []).append(i)
+    return {g: sorted(idx) for g, idx in out.items()}
+
+
 def base_feat_config():
     return {
         "PRISM": [
             Feature(
                 name = "temp_avg",
+                group = "MET",
                 key = "tmean",
                 clip = (-40.0, 120.0),
                 resampling = Resampling.bilinear,
@@ -180,6 +216,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "temp_min",
+                group = "MET",
                 key = "tmin",
                 clip = (-40.0, 120.0),
                 resampling = Resampling.bilinear,
@@ -188,6 +225,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "temp_max",
+                group = "MET",
                 key = "tmax",
                 clip = (-40.0, 120.0),
                 resampling = Resampling.bilinear,
@@ -196,6 +234,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "dewpoint",
+                group = "MET",
                 key = "tdmean",
                 clip = (-60.0, 90.0),
                 resampling = Resampling.bilinear,
@@ -204,6 +243,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "vpd_min",
+                group = "MET",
                 key = "vpdmin",
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
@@ -212,6 +252,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "vpd_max",
+                group = "MET",
                 key = "vpdmax",
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
@@ -220,6 +261,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "precip_mm",
+                group = "MET",
                 key = "ppt",
                 clip = (0, 150),
                 resampling = Resampling.bilinear,
@@ -230,6 +272,7 @@ def base_feat_config():
         "AORC": [
             Feature(
                 name = "rel_humidity",
+                group = "MET",
                 key = "rel_humidity",
                 clip = (0.0, 100.0),
                 resampling = Resampling.bilinear,
@@ -246,6 +289,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "wind_mph",
+                group = "MET",
                 key = "wind_mph",
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
@@ -279,6 +323,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "usfs_KDE",
+                group = "STATE",
                 # KDE names are "kde_[burn cause]"
                 expand_names = ["kde_natural_lightning", "kde_human", "kde_industrial", "kde_debris"],
                 key = "Fire_KDE",
@@ -296,6 +341,7 @@ def base_feat_config():
         "USDA_WUI": [
             Feature(
                 name = "usda_hs_density_km2",
+                group = "QUASI_STATIC",
                 key = "hs_density",
                 # 99 percentile clip in processor
                 time_interp = ("existing", "linear"),
@@ -303,6 +349,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "usda_wui_index",
+                group = "QUASI_STATIC",
                 key = "wui_index",
                 # nearest: the index is ordinal; linear blends across classes
                 time_interp = ("existing", "nearest"),
@@ -310,6 +357,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "usda_dist_to_wui_km",
+                group = "QUASI_STATIC",
                 key = "dist_to_interface",
                 time_interp = ("existing", "linear"),
                 ds_norms = ["z_score"]
@@ -318,6 +366,7 @@ def base_feat_config():
         "GPW": [
             Feature(
                 name = "pop_density",
+                group = "QUASI_STATIC",
                 resampling = Resampling.nearest,
                 time_interp = ("existing", "linear"),
                 ds_clip = (0.0, np.inf),
@@ -327,6 +376,7 @@ def base_feat_config():
         "LANDFIRE": [
             Feature(
                 name = "lf_elevation",
+                group = "STATIC",
                 key = "_Elev",
                 resampling = Resampling.bilinear,
                 clip = (0.0, 5000.0),
@@ -335,6 +385,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "lf_slope",
+                group = "STATIC",
                 key = "_SlpD",
                 resampling = Resampling.bilinear,
                 time_interp = ("broadcast", "linear"),
@@ -352,6 +403,7 @@ def base_feat_config():
         "MODIS": [
             Feature(
                 name = "modis_lai",
+                group = "STATE",
                 key = "MCD15A2H",
                 # simple reprojection
                 resampling = Resampling.nearest, 
@@ -371,6 +423,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "modis_months_since_last_burn",
+                group = "STATE",
                 key = "MCD64A1",
                 # 0/1 is ordinal
                 resampling = Resampling.nearest,
@@ -386,6 +439,7 @@ def base_feat_config():
             # using other features in place
             Feature(
                 name = "frac_imp_surface",
+                group = "QUASI_STATIC",
                 key = "FctImp",
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
@@ -393,6 +447,7 @@ def base_feat_config():
             ),
             Feature(
                 name = "canopy_cover_pct",
+                group = "QUASI_STATIC",
                 key = "tccconus",
                 resampling = Resampling.bilinear,
                 time_interp = ("existing", "linear"),
@@ -402,6 +457,7 @@ def base_feat_config():
         "LIGHTNING": [
             Feature(
                 name = "lightning_strikes",
+                group = "STATE",
                 # daily CG strike count per 0.1 deg tile
                 resampling = Resampling.nearest,
                 # the product already carries a value (>=1 or a true zero) for
@@ -413,6 +469,7 @@ def base_feat_config():
         "CENSUSROADS": [
             Feature(
                 name = "d_to_road",
+                group = "STATIC",
                 resampling = Resampling.nearest,
                 time_interp = ("broadcast", "linear"),
                 ds_clip=(0, 10000), # 10km
@@ -434,6 +491,7 @@ def drv_feat_config() -> List[Feature]:
             inputs=["usfs_burn_occ", "usfs_perimeter"],
         ),
         Feature(name = "fire_spatial_roll",
+            group = "STATE",
             func = "build_fire_spatial_rolling",
             inputs=["usfs_burn_occ", "usfs_perimeter"],
             drop_inputs=["usfs_burn_occ", "usfs_perimeter"],
@@ -457,6 +515,7 @@ def drv_feat_config() -> List[Feature]:
         ),
         Feature(
             name = "ndvi_anomaly",
+            group = "STATE",
             func = "build_ndvi_anomaly",
             inputs=["modis_ndvi"],
             train_dependent=True,
@@ -466,11 +525,13 @@ def drv_feat_config() -> List[Feature]:
             ds_norms = ["z_score"],
         ),
         Feature(expand_names = ["precip_2d", "precip_5d"],
+            group = "MET",
             func = "build_precip_cum",
             inputs=["precip_mm"], drop_inputs = None,
             ds_norms = ["log1p", "z_score"],
         ),
         Feature(expand_names = ["dead_fmo_100hr", "dead_fmo_1000hr"],
+            group = "MET",
             func = "build_dead_fuel_derived",
             inputs=["temp_min", "temp_max", "rel_humidity", "rh_max", "precip_mm"],
             # EMCbar uses the diurnal extremes; rh_max is consumed and dropped.
@@ -478,28 +539,33 @@ def drv_feat_config() -> List[Feature]:
             ds_norms = ["z_score"],
         ),
         Feature(name = "lightning_load",
+            group = "STATE",
             func = "build_lightning_load",
             inputs=["lightning_strikes"], drop_inputs = None,
             ds_norms = ["log1p", "z_score"],
         ),
         Feature(expand_names = ["wind_dir_ew", "wind_dir_ns"],
+            group = "MET",
             func = "build_wind_ew_ns",
             inputs=["wind_dir"],
             drop_inputs=["wind_dir"],
         ),
         Feature(expand_names = ["lf_aspect_ew", "lf_aspect_ns"],
+            group = "STATIC",
             func = "build_aspect_ew_ns",
             inputs=["lf_aspect"],
             drop_inputs=["lf_aspect"],
         ),
         Feature(
             name = "fosberg_fwi",
+            group = "MET",
             func = 'build_ffwi',
             inputs=["temp_avg", "rel_humidity", "wind_mph"],
             ds_norms = ["z_score"],
         ),
         Feature(
             name = "doy_sin",
+            group = "SCALAR",
             func="build_doy_sin",
             inputs=["time"]
         ),

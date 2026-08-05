@@ -1,8 +1,11 @@
 """
-Splits store one pre-stacked (time, channel, y, x) float32 array "X" 
-plus per-day label and mask arrays; a window sample is a single contiguous 
-time-slice read, and all channel bookkeeping comes from the dataset's 
-manifest.json.
+Splits store one pre-stacked (time, channel, y, x) float32 array "X" plus
+per-day label and mask arrays. A sample splits X's channel axis into a
+dynamic block (met + state channels, read across the full window) and a
+static block (terrain, infrastructure, and vegetation-context channels plus
+a day-of-year scalar plane, read once at the window's final day). 
+Channel grouping comes from feature_config.channel_group_indices; window, crop.
+Halo bookkeeping comes from the dataset's manifest.json.
 """
 import json
 import random
@@ -14,6 +17,7 @@ from torch.utils.data import Dataset, DataLoader, get_worker_info
 import xarray as xr
 
 from ..config.dataset_config import DatasetConfig, get_dataset_config
+from ..config.feature_config import channel_group_indices
 
 # -- the encoder's total stride and the attention window compose, so a crop whose
 # -- origin is not a multiple of their product shifts the window partition relative
@@ -37,8 +41,11 @@ daskconfig.set(scheduler='synchronous')
 
 
 class FireDataset(Dataset):
-    """ Yields spatiotemporal windows:
-        - X: (T, C, H, W) float32, the model input window
+    """ Yields spatiotemporal windows as ((x_dyn, x_static), labels, masks):
+        - x_dyn: (T, 26, H, W) float32, met + state channels across the window
+        - x_static: (12, H, W) float32, terrain/infrastructure/vegetation-context
+          channels at the window's final day, with a day-of-year scalar plane
+          appended last
         - labels/masks: (H, W) at the window's final day (the prediction target
           is a fresh ignition within the forward horizon of that day)
     """
@@ -62,6 +69,23 @@ class FireDataset(Dataset):
         self.X = self.ds["X"]
 
         self.feature_names = list(self.manifest["channels"])
+
+        groups = channel_group_indices(self.feature_names)
+        self._dyn_idx = sorted(groups["MET"] + groups["STATE"])
+        self._static_idx = sorted(groups["STATIC"] + groups["QUASI_STATIC"])
+        scalar_idx = groups["SCALAR"]
+        assert len(scalar_idx) == 1, f"SCALAR group must be a single channel, got {scalar_idx}"
+        self._scalar_idx = scalar_idx[0]
+        self.dyn_channels = len(self._dyn_idx)
+        self.static_channels = len(self._static_idx) + 1  # + the appended scalar plane
+
+        # -- positions within x_dyn's channel axis, not the manifest's, so the
+        # -- model can slice its MET/STATE branches out of the read tensor
+        dyn_pos = {c: i for i, c in enumerate(self._dyn_idx)}
+        self.dyn_groups = {
+            name: sorted(dyn_pos[c] for c in groups[name]) for name in ("MET", "STATE")
+        }
+
         self.label_names = list(self.manifest["labels"])
         self.mask_names = list(self.manifest["masks"])
         self.in_channels = int(self.manifest["in_channels"])
@@ -139,7 +163,7 @@ class FireDataset(Dataset):
         x = self._rng.integers(0, (W - self.read_size) // align + 1) * align
         return int(y), int(x)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict, Dict]:
+    def __getitem__(self, idx: int) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Dict, Dict]:
         t0 = int(self.window_starts[idx])
         t1 = t0 + self.window_size
         last = t1 - 1
@@ -154,9 +178,16 @@ class FireDataset(Dataset):
             xsel = slice(x0, x0 + self.read_size)
             keep = (self._keep_span(y0, H), self._keep_span(x0, W))
 
-        x = torch.from_numpy(
-            np.ascontiguousarray(self.X.isel(time=slice(t0, t1), y=ysel, x=xsel).values)
-        )  # (T, C, H, W) float32
+        # (T, 26, H, W) float32
+        x_dyn = torch.from_numpy(np.ascontiguousarray(
+            self.X.isel(time=slice(t0, t1), channel=self._dyn_idx, y=ysel, x=xsel).values
+        ))
+
+        # (12, H, W) float32
+        static_idx = self._static_idx + [self._scalar_idx]  # scalar plane last
+        x_static = torch.from_numpy(np.ascontiguousarray(
+            self.X.isel(time=last, channel=static_idx, y=ysel, x=xsel).values
+        ))
 
         labels = {
             name: torch.as_tensor(self.ds[name].isel(time=last, y=ysel, x=xsel).values)
@@ -174,7 +205,7 @@ class FireDataset(Dataset):
             masks = {
                 name: self._halo_masked(m, keep) for name, m in masks.items()
             }
-        return x, labels, masks
+        return (x_dyn, x_static), labels, masks
 
     # -- a crop side on the domain edge loses no context: its padding is what
     # -- full-grid inference sees anyway, so those cells stay supervised. Holding

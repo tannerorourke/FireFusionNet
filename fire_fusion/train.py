@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.amp.autocast_mode import autocast
 
 import json
+import math
 import numpy as np
 from typing import Literal, Dict
 from tqdm import tqdm
@@ -17,7 +18,9 @@ from .train_utils import (
     estimate_model_size_mb, set_global_seed, get_device_config, checkpoint_name,
     save_model, load_model, save_calibration, export_to_b2, WarmupCosineAnnealingLR
 )
-from .analysis.metrics import MetricsManager, PlattScaler, expected_calibration_error
+from .analysis.metrics import (
+    MetricsManager, PlattScaler, CauseVectorScaler, expected_calibration_error
+)
 from .analysis.plots import (
     plot_class_accuracy, plot_loss_curves, plot_rates_per_epoch, reliability_diagram
 )
@@ -34,11 +37,10 @@ class WRMTrainer:
         experiment: str = "smoke",
         seed: int = 42,
         mode: Literal['train', 'test'] = 'train',
-        stage: Literal['pretrain', 'specialize'] = 'pretrain',
         init_from: str | None = None,
         freeze: Literal['none', 'main', 'heads'] = 'none',
         alpha_ign: float = 1.0,
-        alpha_cause: float = 1.0,
+        alpha_cause: float | str = 1.0,
         export_b2: bool = False,
         debug: bool = False
     ):
@@ -47,23 +49,22 @@ class WRMTrainer:
         self.seed = seed
         set_global_seed(seed)
 
-        self.device = device;
+        self.device = device
         self.use_amp = bool(device.type == "cuda")
         self.debug = debug
 
         self.dataset_name = dataset_name
         self.experiment = experiment
         self.export_b2 = export_b2
-        self.stage = stage
-        self.stage_base = checkpoint_name(experiment, stage)
+        self.stage_base = checkpoint_name(experiment)
         self.freeze = freeze
         self.alpha_ign = alpha_ign
-        self.alpha_cause = alpha_cause
 
-        # fp16 gradients underflow well before the ignition loss does (pos_weight
-        # is O(1e4)); the scaler keeps them representable and drops any step that
-        # still overflows
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        # -- the training loss scores every positive cell but only a fraction r of
+        # -- the negatives, which moves the population optimum by exactly log(r) in
+        # -- logit space and nothing else; evaluation adds that offset back
+        self.neg_keep_rate = float(training_params.get("neg_keep_rate", 1.0))
+        self.logit_offset = math.log(self.neg_keep_rate)
 
         # the look-back length is a hyperparameter of the experiment, not a
         # property of the loader; both splits must read the same one or the
@@ -89,24 +90,26 @@ class WRMTrainer:
             encoder_depth=encoder_depth, attn_window=attn_window,
         )
 
-        # channel count, output size, cause classes, and class balance come from
-        # the built dataset's manifest, not from hardcoded params
+        # channel counts, channel grouping, output size, cause classes, and class
+        # balance come from the built dataset's manifest, not from hardcoded params
         train_set = self.train_loader.dataset
         model_params = dict(model_params)
         model_params["n_cause_classes"] = train_set.n_cause_classes
-        in_channels = train_set.in_channels
+        model_params["dyn_groups"] = train_set.dyn_groups
         ign_pos_weight = train_set.ign_pos_weight
         print(f"[WRMTrainer] experiment={experiment} seed={seed}")
-        print(f"[WRMTrainer] dataset={dataset_name} in_channels={in_channels} "
+        print(f"[WRMTrainer] dataset={dataset_name} "
+              f"channels={train_set.dyn_channels} dyn + {train_set.static_channels} static "
               f"grid={list(train_set.out_size)} "
               f"cause_classes={model_params['n_cause_classes']} "
-              f"pos_weight={ign_pos_weight:.2f} "
               f"prevalence={1.0 / max(ign_pos_weight, 1e-9):.2e} (PR-AUC baseline)")
 
-        self.model = FireFusionModel(in_channels, mp=model_params).to(self.device)
+        self.model = FireFusionModel(
+            train_set.dyn_channels, train_set.static_channels, mp=model_params
+        ).to(self.device)
 
-        # Warm-start from a checkpointed main model, then freeze the requested
-        # group so the other group specializes against a fixed representation.
+        # Warm-start from a checkpointed model, then freeze the requested group so
+        # the other group specializes against a fixed representation.
         if init_from is not None:
             load_model(self.model, init_from, map_location=self.device)
             print(f"[WRMTrainer] initialized weights from {init_from}")
@@ -118,42 +121,44 @@ class WRMTrainer:
             )
         n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.model.parameters())
-        print(f"[WRMTrainer] stage={stage} freeze={freeze} "
+        print(f"[WRMTrainer] freeze={freeze} "
               f"alpha_ign={alpha_ign} alpha_cause={alpha_cause} "
+              f"neg_keep_rate={self.neg_keep_rate} "
               f"trainable_params={n_train}/{n_total}")
 
-        # a head-only specialize stage converges in a fraction of the epochs a
-        # backbone needs, so a stage may carry its own budget
-        ep = training_params.get("stages", {}).get(stage, {}).get(
-            "epochs", training_params["epochs"]
-        )
+        ep = training_params["epochs"]
         self.ep_warmup, self.ep_max, self.ep_early_stop = ep[0], ep[1], ep[2]
         self.min_lr = training_params["min_lr"]
         self.base_lr = training_params["base_lr"]
         self.weight_decay = training_params["weight_decay"]
         self.grad_clip = training_params["grad_clip"]
-        
-        self.ign_pos_weight = torch.as_tensor(
-            [float(ign_pos_weight)], dtype=torch.float32, device=device
-        )
-        self.bcewl_loss = nn.BCEWithLogitsLoss(reduction="none", pos_weight=self.ign_pos_weight)
 
-        # Cause classes span roughly two orders of magnitude, so an unweighted mean
-        # cross-entropy is minimized by never predicting the rare ones. The cause
-        # score is macro-averaged over classes, which an inverse-frequency weight is
-        # the consistent estimator for; `cause_weight_beta` tempers it toward the
-        # empirical prior when the rarest class is too thin to carry full weight.
+        self.bcewl_loss = nn.BCEWithLogitsLoss(reduction="none")
+
+        # -- Inverse-frequency class weight: cause classes span two orders of
+        #    magnitude, so an unweighted mean cross-entropy is minimized by never
+        #    predicting the rare ones. `cause_weight_beta` tempers it toward the
+        #    empirical prior when the rarest class is too thin to carry full weight.
         beta = training_params.get("cause_weight_beta", 1.0)
         counts = torch.as_tensor(train_set.cause_counts, dtype=torch.float32, device=device)
         w = (counts.sum() / counts.clamp(min=1)) ** beta
         self.cause_weight = w / w.mean()
         print(f"[WRMTrainer] cause_counts={train_set.cause_counts} beta={beta} "
               f"cause_weight={[round(v, 3) for v in self.cause_weight.tolist()]}")
-        # best epoch / early stopping key off the ignition head's masked PR-AUC
-        # rather than total validation loss: it is the reported claim, and it
-        # excludes the sparse cause term from the choice of checkpoint
+
+        # -- the two terms differ by an order of magnitude at initialization, so a
+        # -- fixed weight quietly turns the run single-task; 'auto' puts the cause
+        # -- term on the ignition term's scale before the first step
+        self.alpha_cause = (
+            self._measure_alpha_cause() if alpha_cause == "auto" else float(alpha_cause)
+        )
+
+        # best epoch and early stopping key off the ignition head's masked
+        # ignorance, the same score the run is evaluated on, so the selected
+        # checkpoint is the one that reads best on what is reported
         self.mm = MetricsManager(
-            num_classes=(2, train_set.n_cause_classes), select_by="pr_auc"
+            num_classes=(2, train_set.n_cause_classes),
+            select_by=training_params.get("select_by", "val_ign"),
         )
 
         if mode == "train": self.train()
@@ -180,6 +185,53 @@ class WRMTrainer:
 
         return ign_golds, cause_golds, ign_mask, cause_mask
 
+    def _thinned_mask(self, ign_golds: torch.Tensor, ign_mask: torch.Tensor) -> torch.Tensor:
+        # -- negatives outnumber positives by three orders of magnitude, so nearly
+        # -- every gradient is background. Every positive is kept; negatives survive
+        # -- at neg_keep_rate.
+        draw = torch.rand(ign_mask.shape, device=ign_mask.device) < self.neg_keep_rate
+        return ign_mask & ((ign_golds == 1) | draw)
+
+    def _measure_alpha_cause(self, n_batches: int = 4, max_batches: int = 16) -> float:
+        self.model.eval()
+        ign_sum, ign_n, cause_sum, cause_n = 0.0, 0, 0.0, 0
+
+        with torch.no_grad():
+            # -- cause cells are sparse enough that a small crop can miss them for
+            # -- several consecutive batches; keep drawing until two carried some
+            for i, ((x_dyn, x_static), golds, masks) in enumerate(self.train_loader):
+                if i >= n_batches and cause_n >= 2 or i >= max_batches:
+                    break
+                x_dyn, x_static = x_dyn.to(self.device), x_static.to(self.device)
+                golds = { k: v.to(self.device) for k, v in golds.items() }
+                masks = { k: v.to(self.device) for k, v in masks.items() }
+
+                ign_golds, cause_golds, ign_mask, cause_mask = self._prepare_targets(golds, masks)
+                loss_mask = self._thinned_mask(ign_golds, ign_mask)
+
+                with autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
+                    ign_logits, cause_logits = self.model(x_dyn, x_static)
+                    _, ign_loss, cause_loss = self._compute_loss(
+                        ign_logits, ign_golds, cause_logits, cause_golds,
+                        loss_mask, cause_mask
+                    )
+
+                if loss_mask.any():
+                    ign_sum += ign_loss.item()
+                    ign_n += 1
+                if cause_mask.any():
+                    cause_sum += cause_loss.item()
+                    cause_n += 1
+
+        if cause_n == 0:
+            print("[WRMTrainer] alpha_cause=auto saw no cause cells, using 1.0")
+            return 1.0
+
+        ratio = (ign_sum / max(ign_n, 1)) / (cause_sum / cause_n)
+        print(f"[WRMTrainer] alpha_cause=auto over {ign_n} batch(es): "
+              f"L_ign/L_cause={ratio:.5f}")
+        return ratio
+
     def _compute_loss(self,
         ign_logits: torch.Tensor, ign_golds: torch.Tensor,  # (B, 1, H, W), (B, H, W)
         cause_logits: torch.Tensor,                         # (B, num_classes, H, W)
@@ -201,7 +253,7 @@ class WRMTrainer:
 
         masked_ign_loss = ign_loss * ign_mask
         ign_loss = (
-            (masked_ign_loss.sum()) / 
+            (masked_ign_loss.sum()) /
             (ign_mask.sum() + 1e-6)
         )
 
@@ -227,47 +279,31 @@ class WRMTrainer:
         ep_ign_loss: float = 0.0
         ep_cause_loss: float = 0.0
         n_samples: int = 0
-        
-        for X, golds, masks in tqdm(self.train_loader, desc="Training...", leave=False):
-            X = X.to(self.device)
+
+        for (x_dyn, x_static), golds, masks in tqdm(self.train_loader, desc="Training...", leave=False):
+            x_dyn = x_dyn.to(self.device)
+            x_static = x_static.to(self.device)
             golds = { k: v.to(self.device) for k, v in golds.items() }
             masks = { k: v.to(self.device) for k, v in masks.items() }
 
             if epoch == 1 and self.debug:
-                print(f"[DataCheck] X shape: {tuple(X.shape)}  (expected: B, T, C, H, W)")
-                # Basic tensor stats
-                print(f"[DataCheck] Feature min/max: {X.min().item():.4f} / {X.max().item():.4f}")
-                print(f"[DataCheck] Feature mean/std: {X.mean().item():.4f} / {X.std().item():.4f}")
-                print(f"[DataCheck] Feature NaNs: {torch.isnan(X).sum().item()}")
-                print(f"[DataCheck] Feature Infs: {torch.isinf(X).sum().item()}")
-                print(f"[DataCheck] golds shape:", golds["ign_next"].shape)
-                print(f"[DataCheck] golds dtype:", golds["ign_next"].dtype)
-                print(f"[DataCheck] target min/max:", golds["ign_next"].min().item(), golds["ign_next"].max().item())
-                print(f"[DataCheck] unique golds (sample):", torch.unique(golds["ign_next"]).cpu()[:10])
-                # Per-label checks
-                for name, y in golds.items():
-                    print(f"[DataCheck] Label '{name}' shape: {tuple(y.shape)}  (expected: B, H, W)")
-                    print(f"             unique vals: {torch.unique(y).tolist()}")
-                # Per-mask checks
-                for name, m in masks.items():
-                    print(f"[DataCheck] Mask '{name}' shape: {tuple(m.shape)}  (expected: B, H, W)")
-                    print(f"             unique vals: {torch.unique(m).tolist()}")
-                # Memory estimate
-                bytes_per_batch = X.numel() * X.element_size()
-                print(f"[DataCheck] Approx batch memory: {bytes_per_batch/1e6:.2f} MB")
-                print("[DataCheck] ✓ Batch looks good.")
-            
+                for name, t in (("x_dyn", x_dyn), ("x_static", x_static)):
+                    print(f"[DataCheck] {name} {tuple(t.shape)} "
+                          f"min/max {t.min().item():.4f}/{t.max().item():.4f} "
+                          f"mean/std {t.mean().item():.4f}/{t.std().item():.4f} "
+                          f"nan={torch.isnan(t).sum().item()} inf={torch.isinf(t).sum().item()}")
+
             self.optimizer.zero_grad(set_to_none=True)
-            # lr_used = self.optimizer.param_groups[0]["lr"]
 
             ign_golds, cause_golds, ign_mask, cause_mask = self._prepare_targets(golds, masks)
+            loss_mask = self._thinned_mask(ign_golds, ign_mask)
 
-            with autocast(device_type=self.device.type, enabled=self.use_amp):
-                ign_logits, cause_logits = self.model(X)         # (B, 1, H, W), (B, num_classes, H, W)
+            with autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
+                ign_logits, cause_logits = self.model(x_dyn, x_static)   # (B, 1, H, W), (B, num_classes, H, W)
 
                 tot_loss, ign_loss, cause_loss = self._compute_loss(
                     ign_logits, ign_golds, cause_logits, cause_golds,
-                    ign_mask, cause_mask,
+                    loss_mask, cause_mask,
                     alpha_ign=self.alpha_ign, alpha_cause=self.alpha_cause
                 )
 
@@ -276,21 +312,22 @@ class WRMTrainer:
             ep_ign_loss += ign_loss.item()
             ep_cause_loss += cause_loss.item()
             n_samples += golds["ign_next"].size(0)
+
+            # -- metrics read the full supervised population, not the thinned one,
+            # -- so training scores stay comparable with the eval split
             self.mm.add('train',
                 logits=[ign_logits.detach().cpu(), cause_logits.detach().cpu()],
                 golds =[ign_golds.detach().cpu(), cause_golds.detach().cpu()],
                 masks =[ign_mask.detach().cpu(), cause_mask.detach().cpu()]
             )
 
-            # Backpropogate -> unscale for clipping -> clip gradients -> step optimizer
-            self.scaler.scale(tot_loss).backward()
-            self.scaler.unscale_(self.optimizer)
+            # Backpropogate -> clip gradients -> step optimizer
+            tot_loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            self.optimizer.step()
             self.scheduler.step()
 
-        self.mm.add_epoch_totals("train", 
+        self.mm.add_epoch_totals("train",
             losses=np.array([ep_total_loss, ep_ign_loss, ep_cause_loss])
         )
 
@@ -301,15 +338,20 @@ class WRMTrainer:
         ep_cause_loss: float = 0.0
         n_samples: int = 0
         with torch.inference_mode():
-            for features, golds, masks in tqdm(self.eval_loader, desc="Evaluating...", leave=False):
-                features = features.to(self.device)
+            for (x_dyn, x_static), golds, masks in tqdm(self.eval_loader, desc="Evaluating...", leave=False):
+                x_dyn = x_dyn.to(self.device)
+                x_static = x_static.to(self.device)
                 golds = { k: v.to(self.device) for k, v in golds.items() }
                 masks = { k: v.to(self.device) for k, v in masks.items() }
-                
+
                 ign_golds, cause_golds, ign_mask, cause_mask = self._prepare_targets(golds, masks)
 
-                with autocast(device_type=self.device.type, enabled=self.use_amp):
-                    ign_logits, cause_logits = self.model(features)
+                with autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
+                    ign_logits, cause_logits = self.model(x_dyn, x_static)
+
+                    # -- undo the subsampling shift so the reported loss and the
+                    # -- selection score both describe the real class balance
+                    ign_logits = ign_logits + self.logit_offset
 
                     tot_loss, ign_loss, cause_loss = self._compute_loss(
                         ign_logits, ign_golds, cause_logits, cause_golds,
@@ -329,43 +371,52 @@ class WRMTrainer:
                     masks =[ign_mask.detach().cpu(), cause_mask.detach().cpu()]
                 )
 
-        self.mm.add_epoch_totals("eval", 
+        self.mm.add_epoch_totals("eval",
             np.array([ep_total_loss, ep_ign_loss, ep_cause_loss])
         )
 
     def fit_calibration(self):
-        """ Fit a Platt calibrator on held-out cells so the ignition head's
-            logits read as probabilities, and persist it beside the checkpoint.
+        """ Fit a calibrator for each head on held-out cells, so the logits read
+            as probabilities, and persist both beside the checkpoint.
 
-            Scores are read on the same supervised-cell population as the loss
-            and metrics (ign_mask), over the eval split. That is the split model
-            selection also reads, so the reported ECE is mildly optimistic; a
-            dedicated calibration split would remove that.
+            Scores are read on the same supervised-cell population as the loss and
+            metrics, over the eval split. That is the split model selection also
+            reads, so the reported ECE is mildly optimistic.
         """
         stage_base = self.stage_base
 
         self.model.eval()
         logits_all, labels_all = [], []
+        cause_logits_all, cause_labels_all = [], []
         with torch.no_grad():
-            for features, golds, masks in tqdm(self.eval_loader, desc="Calibrating...", leave=False):
-                features = features.to(self.device)
+            for (x_dyn, x_static), golds, masks in tqdm(self.eval_loader, desc="Calibrating...", leave=False):
+                x_dyn = x_dyn.to(self.device)
+                x_static = x_static.to(self.device)
                 golds = { k: v.to(self.device) for k, v in golds.items() }
                 masks = { k: v.to(self.device) for k, v in masks.items() }
 
-                ign_golds, _, ign_mask, _ = self._prepare_targets(golds, masks)
-                ign_logits, _ = self.model(features)      # (B, 1, H, W)
+                ign_golds, cause_golds, ign_mask, cause_mask = self._prepare_targets(golds, masks)
+
+                # -- raw logits: the calibrator's own intercept carries the whole
+                # -- correction, so an offset applied here would be counted twice
+                ign_logits, cause_logits = self.model(x_dyn, x_static)
                 ign_logits = ign_logits.squeeze(1)        # (B, H, W)
 
                 logits_all.append(ign_logits[ign_mask].float().cpu())
                 labels_all.append(ign_golds[ign_mask].float().cpu())
+                cause_logits_all.append(
+                    cause_logits.permute(0, 2, 3, 1)[cause_mask].float().cpu()
+                )
+                cause_labels_all.append(cause_golds[cause_mask].long().cpu())
 
         logits = torch.cat(logits_all) if logits_all else torch.empty(0)
         labels = torch.cat(labels_all) if labels_all else torch.empty(0)
         n_cells = int(labels.numel())
         n_pos = int(labels.sum().item())
 
-        pos_weight = float(self.ign_pos_weight.item())
-        scaler = PlattScaler(prior_pos_weight=pos_weight)
+        # -- the trained head's only offset is the subsampling shift, so 1/r is the
+        # -- analytic intercept; the fit refines slope and whatever residual remains
+        scaler = PlattScaler(prior_pos_weight=1.0 / self.neg_keep_rate)
 
         ece_before = expected_calibration_error(torch.sigmoid(logits), labels)
 
@@ -376,18 +427,34 @@ class WRMTrainer:
         probs = scaler.probs(logits)
         ece_after = expected_calibration_error(probs, labels)
 
+        n_cause = self.cause_weight.numel()
+        cause_logits = torch.cat(cause_logits_all) if cause_logits_all else torch.empty(0, n_cause)
+        cause_labels = torch.cat(cause_labels_all) if cause_labels_all else torch.empty(0, dtype=torch.long)
+        cause_scaler = CauseVectorScaler(n_cause, init_b=(-torch.log(self.cause_weight)).tolist())
+
+        # -- a class with no held-out cells gets no gradient, so its scale would
+        # -- drift on the others alone; the analytic init stands for the whole head
+        if int(torch.bincount(cause_labels, minlength=n_cause).min()) > 0:
+            cause_scaler.fit(cause_logits, cause_labels)
+        cause_state = cause_scaler.state()
+
         params = {
             **scaler.state(),
-            "pos_weight": pos_weight,
+            "pos_weight": 1.0,
+            "neg_keep_rate": self.neg_keep_rate,
             "fit_split": "eval",
             "n_cells": n_cells,
             "n_pos": n_pos,
             "ece_before": ece_before,
             "ece_after": ece_after,
+            "cause_a": cause_state["a"],
+            "cause_b": cause_state["b"],
         }
         calib_path = save_calibration(params, name_base=stage_base)
         print(f"[WRMTrainer] calibration a={params['a']:.4f} b={params['b']:.4f} "
               f"ECE {ece_before:.4f} -> {ece_after:.4f}  (n_pos={n_pos}/{n_cells})")
+        print(f"[WRMTrainer] cause calibration b={[round(v, 3) for v in cause_state['b']]} "
+              f"(n_cells={int(cause_labels.numel())})")
         print(f"Saved calibration >> {calib_path}")
 
         if n_cells > 0:
@@ -407,9 +474,9 @@ class WRMTrainer:
             weight_decay=self.weight_decay
         )
         self.scheduler = WarmupCosineAnnealingLR(
-            self.optimizer, 
-            warmup_steps=self.ep_warmup * max(1, len(self.train_loader)), 
-            total_steps=self.ep_max * max(1, len(self.train_loader)), 
+            self.optimizer,
+            warmup_steps=self.ep_warmup * max(1, len(self.train_loader)),
+            total_steps=self.ep_max * max(1, len(self.train_loader)),
             min_lr=self.min_lr
         )
 
@@ -419,14 +486,13 @@ class WRMTrainer:
             f"- min lr: {self.min_lr}, base lr: {self.base_lr}, grad clip: {self.grad_clip}, weight decay: {self.weight_decay}\n",
         )
 
-        # pretrain produces the reusable main model; specialize produces the
-        # head-adapted model. Best weights take the fixed name so --init-from can
-        # reference them; the final weights fall to the next free index.
+        # best weights take the fixed name so --init-from can reference them; the
+        # final weights fall to the next free index
         stage_base = self.stage_base
 
-        # One TensorBoard run per (experiment, stage) invocation; the timestamp
-        # keeps reruns from writing into the same event stream.
-        run_name = f"{self.experiment}_{self.stage}_{strftime('%m%d-%H%M%S')}"
+        # One TensorBoard run per invocation; the timestamp keeps reruns from
+        # writing into the same event stream.
+        run_name = f"{self.experiment}_{strftime('%m%d-%H%M%S')}"
         writer = SummaryWriter(log_dir=str(RUNS_DIR / run_name))
         print(f"[WRMTrainer] tensorboard logdir >> {RUNS_DIR / run_name}")
 
@@ -486,10 +552,10 @@ class WRMTrainer:
         last_ign_cm, ign_rates, ign_cm_record = val_ignit_cm.get_history()
 
         epochs_axis = list(range(1, epochs_ran + 1))
-        
+
         # Train vs. Eval
-        # every plot carries the run's stage_base so artifacts from different
-        # (experiment, stage) runs never overwrite one another in the shared dir
+        # every plot carries the run's stage_base, so artifacts from different
+        # experiments never overwrite one another in the shared directory
         plot_class_accuracy(
             epochs_axis,
             val_ignit_acc, val_cause_acc,
@@ -526,7 +592,7 @@ class WRMTrainer:
 
     def test(self):
         return
-        
+
 
 if __name__ == "__main__":
     import argparse
@@ -536,13 +602,10 @@ if __name__ == "__main__":
                         help="override the dataset the experiment names")
     parser.add_argument("--seed", type=int, default=None,
                         help="override the experiment's seed")
-    parser.add_argument("--stage", choices=["pretrain", "specialize"], default="pretrain",
-                        help="pretrain the main model, or specialize the heads on top of it")
     parser.add_argument("--init-from", default=None,
                         help="checkpoint to warm-start from (bare name resolves under model/saved)")
     parser.add_argument("--freeze", choices=["none", "main", "heads"], default=None,
-                        help="freeze the backbone ('main') or the decoder ('heads'); "
-                             "defaults to the experiment's per-stage value")
+                        help="freeze the backbone ('main') or the decoder ('heads')")
     parser.add_argument("--alpha-ign", type=float, default=None, help="ignition loss weight")
     parser.add_argument("--alpha-cause", type=float, default=None, help="cause loss weight")
     parser.add_argument("--export-b2", action="store_true",
@@ -561,11 +624,9 @@ if __name__ == "__main__":
     model_params        = params["model"]
     training_params     = params["training"]
 
-    # a window read decompresses a whole time-chunk of the split zarr, so the loader
-    # is IO-bound well before the GPU is and a many-core box wants several workers.
-    # Each one holds prefetched windows in pinned memory though, so the ceiling
-    # belongs to the experiment: a full-grid profile on a small card cannot afford
-    # what a cropped one can.
+    # -- a window read decompresses a whole time-chunk of the split zarr, so the
+    #    loader is IO-bound before the GPU is. Each worker holds prefetched windows
+    #    in pinned memory, so the ceiling belongs to the experiment.
     device, num_workers = get_device_config(maximum=training_params.get("max_workers", 8))
 
     # an experiment names the dataset and seed it was defined against, so the
@@ -573,21 +634,11 @@ if __name__ == "__main__":
     dataset = args.dataset if args.dataset is not None else params["dataset"]
     seed = args.seed if args.seed is not None else training_params["seed"]
 
-    # Resolve stage knobs: an explicit CLI flag wins, else the experiment's
-    # per-stage default, else the experiment's training default, else the hardcoded
-    # fallback. This keeps the plain `--dataset/--experiment` invocation unchanged.
-    stage_defaults = training_params.get("stages", {}).get(args.stage, {})
-
-    def _resolve(cli_val, key, fallback):
-        if cli_val is not None:
-            return cli_val
-        if key in stage_defaults:
-            return stage_defaults[key]
-        return training_params.get(key, fallback)
-
-    freeze      = _resolve(args.freeze, "freeze", "none")
-    alpha_ign   = _resolve(args.alpha_ign, "alpha_ign", 1.0)
-    alpha_cause = _resolve(args.alpha_cause, "alpha_cause", 1.0)
+    # an explicit CLI flag wins, else the experiment's own value, else the
+    # hardcoded fallback
+    freeze      = args.freeze if args.freeze is not None else training_params.get("freeze", "none")
+    alpha_ign   = args.alpha_ign if args.alpha_ign is not None else training_params.get("alpha_ign", 1.0)
+    alpha_cause = args.alpha_cause if args.alpha_cause is not None else training_params.get("alpha_cause", 1.0)
 
     wt = WRMTrainer(
         model_params, training_params,
@@ -596,7 +647,6 @@ if __name__ == "__main__":
         experiment = args.experiment,
         seed = seed,
         mode = "train",
-        stage = args.stage,
         init_from = args.init_from,
         freeze = freeze,
         alpha_ign = alpha_ign,

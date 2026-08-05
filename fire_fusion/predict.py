@@ -1,10 +1,15 @@
 """Turn a trained FireFusion checkpoint into per-cell ignition probabilities.
 
-An input is a spatiotemporal cube (B, T, C, H, W) spanning days [t_0..t_n]; the
-output is a (B, 1, H, W) map of P(fresh ignition at t_{n+1}) in [0, 1]. The model
-emits raw logits; a fitted Platt calibrator maps them to probabilities. Absent a
-fitted sidecar, the analytic prior correction for the training class weight
-(sigmoid(z - log(pos_weight))) stands in, so a checkpoint is always usable.
+Input:
+    - Dynamic cube (B, T, C_dyn, H, W) spanning days [t_0..t_n]
+    - static maps (B, C_static, H, W) read at t_n;
+
+Output:
+    - A (B, 1, H, W) map of P(fresh ignition within 7 days of t_n) in [0, 1]. '
+
+The model emits raw logits; a fitted Platt calibrator maps them to probabilities. 
+Absent a fitted sidecar, the analytic correction for the training-time negative 
+subsampling stands into make checkpoints usable.
 """
 import argparse
 import json
@@ -15,6 +20,7 @@ import numpy as np
 import torch
 
 from .config.dataset_config import get_dataset_config
+from .config.feature_config import channel_group_indices
 from .config.path_config import MODEL_DIR, PLOTS_DIR
 from .dataset.data_loader import init_data_loader
 from .model.model import FireFusionModel
@@ -31,15 +37,17 @@ class FirePredictor:
 
     @torch.no_grad()
     def predict_proba(
-        self, cube: torch.Tensor, land_mask: torch.Tensor | None = None
+        self, x_dyn: torch.Tensor, x_static: torch.Tensor,
+        land_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """ cube: (B, T, C, H, W) -> (B, 1, H, W) probabilities for t_{n+1}.
+        """ (B, T, C_dyn, H, W) + (B, C_static, H, W) -> (B, 1, H, W) probabilities.
 
         land_mask (1 where usable) marks non-land cells NaN so an ocean cell is
         never read as a fire probability.
         """
-        cube = cube.to(self.device)
-        ign_logits, _ = self.model(cube)              # (B, 1, H, W)
+        x_dyn = x_dyn.to(self.device)
+        x_static = x_static.to(self.device)
+        ign_logits, _ = self.model(x_dyn, x_static)   # (B, 1, H, W)
         probs = self.calibrator.probs(ign_logits.float())
 
         if land_mask is not None:
@@ -59,8 +67,8 @@ def load_predictor(
 ) -> FirePredictor:
     """ Rebuild the model, load weights, attach a calibrator.
 
-    Channel count, cause classes, and class weight come from the dataset manifest;
-    the attention and embedding shape come from the params.json experiment, so a
+    Channel grouping and cause classes come from the dataset manifest; the
+    attention and embedding shape come from the params.json experiment, so a
     mismatch surfaces as a strict state_dict error. Grid extent is not a model
     parameter. Dataset and checkpoint default to the experiment's own.
     """
@@ -72,30 +80,41 @@ def load_predictor(
     if dataset_name is None:
         dataset_name = params["dataset"]
     if checkpoint is None:
-        checkpoint = f"{checkpoint_name(experiment, 'specialize')}.th"
+        checkpoint = f"{checkpoint_name(experiment)}.th"
 
     manifest = json.loads(get_dataset_config(dataset_name or '').manifest_path.read_text())
-    in_channels = int(manifest["in_channels"])
-    pos_weight = float(manifest["ign_pos_weight"])
+
+    # -- the weights are tied to the loader's channel split, so the two paths and
+    # -- the group positions within the dynamic axis are derived the same way here
+    groups = channel_group_indices(list(manifest["channels"]))
+    dyn_idx = sorted(groups["MET"] + groups["STATE"])
+    dyn_pos = {c: i for i, c in enumerate(dyn_idx)}
+    static_channels = len(groups["STATIC"]) + len(groups["QUASI_STATIC"]) + len(groups["SCALAR"])
 
     model_params = dict(params["model"])
     model_params["n_cause_classes"] = int(manifest["n_cause_classes"])
+    model_params["dyn_groups"] = {
+        name: sorted(dyn_pos[c] for c in groups[name]) for name in ("MET", "STATE")
+    }
 
-    model = FireFusionModel(in_channels, mp=model_params).to(device)
+    model = FireFusionModel(len(dyn_idx), static_channels, model_params).to(device)
     load_model(model, checkpoint, map_location=device)
     model.eval()
 
-    scaler = PlattScaler(prior_pos_weight=pos_weight).to(device)
+    # -- the head trains against subsampled negatives, and that shift is its only
+    # -- departure from the true prior, so 1/r inverts it exactly
+    prior_pos_weight = 1.0 / params["training"].get("neg_keep_rate", 1.0)
+    scaler = PlattScaler(prior_pos_weight=prior_pos_weight).to(device)
     sidecar = calib if calib is not None else Path(checkpoint).stem
-    params = load_calibration(sidecar)
-    if params is not None:
-        scaler.load_state(params)
-        print(f"[predict] calibration a={params['a']:.4f} b={params['b']:.4f} "
-              f"(ECE {params.get('ece_before', float('nan')):.4f} -> "
-              f"{params.get('ece_after', float('nan')):.4f})")
+    calib_params = load_calibration(sidecar)
+    if calib_params is not None:
+        scaler.load_state(calib_params)
+        print(f"[predict] calibration a={calib_params['a']:.4f} b={calib_params['b']:.4f} "
+              f"(ECE {calib_params.get('ece_before', float('nan')):.4f} -> "
+              f"{calib_params.get('ece_after', float('nan')):.4f})")
     else:
         print(f"[predict] no calibration sidecar for '{sidecar}'; analytic prior "
-              f"b=-log(pos_weight)={-math.log(pos_weight):.4f}")
+              f"b=log(neg_keep_rate)={-math.log(prior_pos_weight):.4f}")
 
     return FirePredictor(model, scaler, device)
 
@@ -115,7 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default=None,
                         help="override the dataset the experiment names")
     parser.add_argument("--checkpoint", default=None,
-                        help="defaults to the experiment's specialized checkpoint")
+                        help="defaults to the experiment's own checkpoint")
     parser.add_argument("--calib", default=None,
                         help="calibration sidecar name; defaults to the checkpoint's")
     parser.add_argument("--split", default="eval", choices=["train", "eval", "test"])
@@ -137,9 +156,9 @@ if __name__ == "__main__":
     )
 
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-    for i, (features, _golds, masks) in enumerate(loader):
+    for i, ((x_dyn, x_static), _golds, masks) in enumerate(loader):
         land = _last_day(masks["land_mask"])
-        probs = predictor.predict_proba(features, land_mask=land)   # (B, 1, H, W)
+        probs = predictor.predict_proba(x_dyn, x_static, land_mask=land)   # (B, 1, H, W)
 
         finite = probs[torch.isfinite(probs)]
         print(f"[predict] batch {i}: P(fire) over land  min={finite.min():.3e}  "

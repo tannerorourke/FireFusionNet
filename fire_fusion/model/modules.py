@@ -1,4 +1,14 @@
+"""
+Spatiotemporal ConvFormer building blocks: 
+Per-group spatial encoder, Static FiLM branch that conditions it, 
+spatial/channel/temporal attention blocks, and the two-headed decoder.
+
+The dynamic path sees one stem per modality group so a missing group is a learned
+token rather than an unrecoverable zero, and the static path enters as FiLM at
+every encoder resolution instead of as extra channels repeated across time.
+"""
 import math
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -7,15 +17,9 @@ from torch.utils.checkpoint import checkpoint
 
 
 def group_norm(channels: int, max_groups: int = 32) -> nn.GroupNorm:
-    """ 
-    Normalizer for the encoder, sized to the largest group count that divides `channels`.
-
-    GroupNorm normalizes each sample independently and keeps no running
-    statistics. BatchNorm's running mean/var would instead be an average over
-    whatever extents were sampled during training, so training on crops drawn
-    from one part of the domain would bake that region's statistics into the
-    normalizer and apply them to every cell at full-domain inference.
-    """
+    # -- GroupNorm keeps no running statistics, so crops drawn from one part of the
+    #    domain cannot bake that region's mean into full-domain inference. Sized to
+    #    the largest group count dividing `channels`.
     return nn.GroupNorm(math.gcd(channels, max_groups), channels)
 
 
@@ -56,19 +60,35 @@ class ConvResidualBlock(nn.Module):
         out = self.relu(out)
         return out
 
+
+FilmLevels = Sequence[Tuple[torch.Tensor, torch.Tensor]]
+
+
+def apply_film(x: torch.Tensor, level: Tuple[torch.Tensor, torch.Tensor], T: int = 1) -> torch.Tensor:
+    """ gamma * x + beta, with a per-sample pair shared across a folded time axis. """
+    gamma, beta = level
+    B = gamma.shape[0]
+    out = gamma.unsqueeze(1) * x.view(B, T, *x.shape[1:]) + beta.unsqueeze(1)
+    return out.reshape(B * T, *out.shape[2:])
+
+
 class SpatialEncoder(nn.Module):
     """
     CNN with Residual Blocks over (H x W), extracting spatial features
     per time step T (we call H' and W')
 
-    Shape: (B, T, C, H, W) --> (B, T, embed_dim, H', W')
+    Shape: (B, T, C_dyn, H, W) --> (B, T, embed_dim, H', W')
+
+    `dyn_groups`: modality group -> channel indices. One stem per group keeps a
+                  group's absence expressible as a learned token; a shared stem
+                  would only offer zeros, which are a legal normalized value.
 
     `depth`: num of stride-2 stages, each doubling RF (in grid cells)
-             A dataset at 1/2 ground resolution needs one more stage to reach 
-             the same distance in kilometres. Holding that distance fixed is what 
+             A dataset at 1/2 ground resolution needs one more stage to reach
+             the same distance in kilometres. Holding that distance fixed is what
              makes results comparable across resolutions.
     """
-    def __init__(self, in_channels, embed_dim, depth: int = 1):
+    def __init__(self, dyn_channels, embed_dim, dyn_groups: Dict[str, List[int]], depth: int = 1):
         super().__init__()
 
         self.base_ch            = 64
@@ -76,11 +96,29 @@ class SpatialEncoder(nn.Module):
         self.down1_dropout      = 0.01
         self.down2_dropout      = 0.01
 
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, self.base_ch, kernel_size=3, padding=1, bias=False),
-            group_norm(self.base_ch),
-            nn.ReLU(inplace=True)
-        )
+        self.group_names = list(dyn_groups)
+        self.group_idx = {g: list(dyn_groups[g]) for g in self.group_names}
+        assert sum(len(i) for i in self.group_idx.values()) == dyn_channels, \
+            "SpatialEncoder: dyn_groups must cover every dynamic channel exactly once"
+
+        # -- remainders spread over the leading groups so the concatenation is
+        #    exactly base_ch wide whatever the group count
+        n = len(self.group_names)
+        widths = {g: self.base_ch // n + (i < self.base_ch % n) for i, g in enumerate(self.group_names)}
+
+        self.stems = nn.ModuleDict({
+            g: nn.Sequential(
+                nn.Conv2d(len(self.group_idx[g]), widths[g], kernel_size=3, padding=1, bias=False),
+                group_norm(widths[g]),
+                nn.ReLU(inplace=True)
+            )
+            for g in self.group_names
+        })
+        # -- group identity, and the vector a dropped group is represented by
+        self.group_embed = nn.ParameterDict({g: nn.Parameter(torch.zeros(widths[g])) for g in self.group_names})
+        self.missing_token = nn.ParameterDict({
+            g: nn.Parameter(torch.randn(widths[g]) * 0.02) for g in self.group_names
+        })
 
         self.down1 = nn.Sequential(
             ConvResidualBlock(self.base_ch, self.base_ch, stride=1, dropout=self.down1_dropout),
@@ -96,28 +134,101 @@ class SpatialEncoder(nn.Module):
             for i in range(depth)
         ])
 
-    def forward(self, x: torch.Tensor):
+    def _stem(self, x: torch.Tensor, B: int, T: int, drop: Optional[Dict[str, torch.Tensor]]) -> torch.Tensor:
+        feats = []
+        for g in self.group_names:
+            h = self.stems[g](x[:, self.group_idx[g]]) + self.group_embed[g].view(1, -1, 1, 1)
+            if drop is not None:
+                # -- a dropped group is substituted wholesale, every day alike
+                gone = drop[g].view(B, 1, 1, 1, 1).expand(B, T, 1, 1, 1).reshape(B*T, 1, 1, 1)
+                h = torch.where(gone, self.missing_token[g].view(1, -1, 1, 1), h)
+            feats.append(h)
+        return torch.cat(feats, dim=1)
+
+    def forward(self, x: torch.Tensor, film: Optional[FilmLevels] = None,
+                drop: Optional[Dict[str, torch.Tensor]] = None):
         B, T, C, H, W = x.shape
 
         # -- every day is encoded independently, so T rides along in the batch axis
-        out = self.stem(x.reshape(B*T, C, H, W))
+        out = self._stem(x.reshape(B*T, C, H, W), B, T, drop)
         out = self.down1(out)
+        if film is not None:
+            out = apply_film(out, film[0], T)
 
         # -- the resolution entering each stage, kept for the decoder to fuse; only
         # -- the predicted day is retained, since that is all the decoder consumes
         skips = [out.view(B, T, *out.shape[1:])[:, -1]]
-        for stage in self.stages[:-1]:
+        for i, stage in enumerate(self.stages):
             out = stage(out)
-            skips.append(out.view(B, T, *out.shape[1:])[:, -1])
-        out = self.stages[-1](out)
+            if film is not None:
+                out = apply_film(out, film[i + 1], T)
+            if i < self.depth - 1:
+                skips.append(out.view(B, T, *out.shape[1:])[:, -1])
 
         e_dim, Hp, Wp = out.shape[1], out.shape[2], out.shape[3]
         return out.reshape(B, T, e_dim, Hp, Wp), skips
 
 
+class StaticFiLMBranch(nn.Module):
+    """
+    Terrain, settlement and date, turned into per-level FiLM for the trunk.
+
+    Input:  static maps (B, C_s, H, W) and a day-of-year scalar (B,)
+    Output: [(gamma, beta)] per encoder level, full resolution first
+
+    Terrain does not change across a look-back window, so carrying it through the
+    temporal path spends T copies of a constant. Modulating the dynamic features
+    instead keeps the interaction (a wind on a steep south slope) and drops the
+    duplication. Heads are zero-initialized, so conditioning starts at identity
+    and the branch only gains influence as gradient arrives.
+    """
+    def __init__(self, static_channels: int, base_ch: int, embed_dim: int, depth: int, width: int = 32):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Conv2d(static_channels, width, kernel_size=3, padding=1, bias=False),
+            group_norm(width),
+            nn.GELU(),
+        )
+        # -- mirrors the encoder's stride-2 stages so every level lands on the
+        #    same extent as the map it modulates, odd sizes included
+        self.downs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(width, width, kernel_size=3, stride=2, padding=1, bias=False),
+                group_norm(width),
+                nn.GELU(),
+            )
+            for _ in range(depth)
+        ])
+
+        level_ch = [base_ch] + [embed_dim] * depth
+        # -- the date enters as a channel, so seasonality can reweight the same map
+        self.heads = nn.ModuleList([nn.Conv2d(width + 1, 2 * c, kernel_size=1) for c in level_ch])
+        for head in self.heads:
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+
+    def forward(self, static: torch.Tensor, doy: torch.Tensor,
+                keep: Optional[torch.Tensor] = None) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        f = self.trunk(static)
+        levels = [f]
+        for down in self.downs:
+            f = down(f)
+            levels.append(f)
+
+        out = []
+        for head, f in zip(self.heads, levels):
+            date_plane = doy.view(-1, 1, 1, 1).expand(-1, 1, *f.shape[-2:])
+            params = head(torch.cat([f, date_plane], dim=1))
+            if keep is not None:
+                params = params * keep.view(-1, 1, 1, 1)
+            gamma_offset, beta = params.chunk(2, dim=1)
+            out.append((1.0 + gamma_offset, beta))
+        return out
+
+
 class WindowedSpatialAttention(nn.Module):
     """
-    Windowed spatial self-attention, as discussed in https://arxiv.org/html/2306.08191v2
+    Windowed spatial self-attention (Owerko et al. 2024, https://arxiv.org/html/2306.08191v2)
     Mixes Spatial attributes (H' x W') at a larger resolution than H' and W'
 
     Shape:  (B, T, C, H', W') --> (B, T, C, H', W') (no change)
@@ -193,10 +304,10 @@ class ChannelMixingAttention(nn.Module):
 
     Shape: (B, T, embed_dim, H', W') --> (B, T, embed_dim, H', W') (no change)
     Steps:
-        - Tokenizes each channel into a d_model vector (value scale + identity)
-        - Applies MH self-attention over channels
-        - Applies MLP
-        - Projects back to a scalar per channel
+        - Tokenizes channels d_model vectors (value scale + identity)
+        - Apply MH self-attention over channels
+        - Apply MLP
+        - Project back to a scalar per channel
 
     Each (b, t, h', w') location is an independent attention problem, so the
     N = B*T*H'*W' locations are processed in chunks: this block lifts every
@@ -204,11 +315,9 @@ class ChannelMixingAttention(nn.Module):
     residual stream around it, which otherwise sets the memory ceiling for the
     whole network. Chunking bounds that peak without altering the result.
     """
-    # A chunk enters attention as (chunk_size, num_heads, C, d_head); the fused
-    # kernels map that leading chunk_size*num_heads onto a CUDA grid dimension and
-    # the launch fails outright past its cap -- hours into a run rather than at
-    # startup. Measured on sm_86: 196608 launches, 262144 raises "invalid
-    # configuration argument". The check runs while the model is built.
+    # The fused kernels map the leading chunk_size*num_heads onto a CUDA grid
+    # dimension and the launch fails past its cap. Measured on sm_86: 196608
+    # passes, 262144 raises 'invalid configuration argument'.
     MAX_ATTN_BATCH = 196608
 
     def __init__(self, num_channels, d_model, num_heads, mlp_ratio, dropout, chunk_size=4096):
@@ -225,11 +334,9 @@ class ChannelMixingAttention(nn.Module):
         self.chunk_size = chunk_size
         self.dropout_p = dropout
 
-        # Per-channel tokenizer: h[n, c, :] = x[n, c] * value_scale[c] + channel_embed[c].
-        # A shared Linear(1, d_model) would map every channel through one vector,
-        # leaving tokens without channel identity -- attention is permutation
-        # equivariant, so two channels holding the same value would be
-        # indistinguishable and no feature-pair interaction could be learned.
+        # Per-channel tokenizer: a shared Linear(1, d_model) would leave tokens
+        # without channel identity, and attention is permutation equivariant, so
+        # two channels holding the same value could not be told apart.
         self.value_scale = nn.Parameter(torch.randn(num_channels, d_model) * 0.02)
         self.channel_embed = nn.Parameter(torch.randn(num_channels, d_model) * 0.02)
 
@@ -272,11 +379,10 @@ class ChannelMixingAttention(nn.Module):
         return self.out_proj(self._mix(self._tokenize(x_chunk))).squeeze(-1)
 
     def forward(self, x: torch.Tensor):
-        # x: (B, T, embed_dim, H', W')
         B, T, embed_dim, Hp, Wp = x.shape
         assert embed_dim == self.num_channels, "ChannelMixBlock: num_channels doesn't match incoming embed_dim"
 
-        # Move to (B*T*H'*W', embed_dim) to operate per spatial-temporal location
+        # -- one independent attention problem per spatial-temporal location
         x_flat = x.permute(0, 1, 3, 4, 2).reshape(B*T*Hp*Wp, embed_dim)
 
         recompute = self.training and torch.is_grad_enabled()
@@ -401,11 +507,14 @@ class BiHeadDecoder(nn.Module):
 
         self.cause_head = nn.Conv2d(head_ch, self.n_cause_classes, kernel_size=1)
 
-    def forward(self, x: torch.Tensor, skips):
+    def forward(self, x: torch.Tensor, skips, film: Optional[FilmLevels] = None):
         f = x
-        for block, skip in zip(self.fuse, reversed(skips)):
+        # -- deepest first; the level the encoder ended on was already conditioned there
+        for i, (block, skip) in enumerate(zip(self.fuse, reversed(skips))):
             f = F.interpolate(f, size=skip.shape[-2:], mode='bilinear', align_corners=False)
             f = block(torch.cat([f, skip], dim=1))
+            if film is not None:
+                f = apply_film(f, film[self.depth - 1 - i])
 
         ignition_logits = self.ignition_head(f) # (B, 1, H, W)
         cause_logits = self.cause_head(f)  # (B, num_classes, H, W)
