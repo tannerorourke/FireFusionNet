@@ -8,6 +8,7 @@ Channel grouping comes from feature_config.channel_group_indices; window, crop.
 Halo bookkeeping comes from the dataset's manifest.json.
 """
 import json
+import platform
 import random
 from typing import Dict, Literal, Tuple
 
@@ -274,9 +275,9 @@ def init_data_loader(
         batch_size=batch_size,
         shuffle=(split == 'train'),
         num_workers=num_workers,
-        # -- unpinned on purpose: WSL2 caps the pinned-host pool and prefetched
-        #    full-grid windows exhaust it; H2D copies are tiny next to zarr reads
-        pin_memory=False,
+        # -- WSL2 caps the pinned-host pool and prefetched full-grid windows
+        #    exhaust it; native Linux hosts pin normally
+        pin_memory="microsoft" not in platform.uname().release.lower(),
         persistent_workers=(num_workers > 0),
         generator=generator,
         worker_init_fn=_seed_worker if seed is not None else None,

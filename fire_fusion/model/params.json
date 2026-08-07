@@ -78,7 +78,7 @@
       "batch_size": 4,
       "epochs": [
         5,
-        60,
+        32,
         10
       ],
       "min_lr": 1e-06,
@@ -124,7 +124,7 @@
       "batch_size": 4,
       "epochs": [
         5,
-        60,
+        32,
         10
       ],
       "min_lr": 1e-06,
@@ -170,7 +170,7 @@
       "batch_size": 4,
       "epochs": [
         5,
-        60,
+        32,
         10
       ],
       "min_lr": 1e-06,
@@ -216,7 +216,7 @@
       "batch_size": 12,
       "epochs": [
         5,
-        60,
+        32,
         10
       ],
       "min_lr": 1e-06,
@@ -262,7 +262,7 @@
       "batch_size": 12,
       "epochs": [
         5,
-        60,
+        32,
         10
       ],
       "min_lr": 1e-06,
@@ -308,7 +308,7 @@
       "batch_size": 8,
       "epochs": [
         5,
-        60,
+        32,
         10
       ],
       "min_lr": 1e-06,
@@ -354,7 +354,7 @@
       "batch_size": 8,
       "epochs": [
         5,
-        60,
+        32,
         10
       ],
       "min_lr": 1e-06,
@@ -398,13 +398,14 @@
     "training": {
       "seed": 1,
       "batch_size": 2,
+      "accum_steps": 4,
       "epochs": [
         5,
-        60,
+        32,
         10
       ],
       "min_lr": 1e-06,
-      "base_lr": 0.0005,
+      "base_lr": 0.001,
       "weight_decay": 0.0001,
       "grad_clip": 1.0,
       "crop_size": null,
@@ -444,13 +445,14 @@
     "training": {
       "seed": 2,
       "batch_size": 2,
+      "accum_steps": 4,
       "epochs": [
         5,
-        60,
+        32,
         10
       ],
       "min_lr": 1e-06,
-      "base_lr": 0.0005,
+      "base_lr": 0.001,
       "weight_decay": 0.0001,
       "grad_clip": 1.0,
       "crop_size": null,
@@ -490,13 +492,14 @@
     "training": {
       "seed": 1,
       "batch_size": 2,
+      "accum_steps": 4,
       "epochs": [
         5,
-        60,
+        32,
         10
       ],
       "min_lr": 1e-06,
-      "base_lr": 0.0005,
+      "base_lr": 0.001,
       "weight_decay": 0.0001,
       "grad_clip": 1.0,
       "crop_size": null,

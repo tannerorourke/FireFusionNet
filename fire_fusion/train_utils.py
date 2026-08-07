@@ -31,6 +31,10 @@ def checkpoint_name(experiment: str) -> str:
 
 def get_device_config(maximum: int | None = None, utilization: float | None = 0.75):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # -- TF32 covers the fp32 matmuls left outside the bf16 autocast; free
+    #    accuracy-wise at these magnitudes, large on Ampere+ tensor cores
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     cpus = os.cpu_count() or 1
 
     if utilization is not None:

@@ -72,7 +72,7 @@ def main():
 
     model = FireFusionModel(ds.dyn_channels, ds.static_channels, mp=mp).to(device)
     ckpt = args.checkpoint or checkpoint_name(args.experiment)
-    load_model(model, ckpt, map_location=device)
+    load_model(model, f"{ckpt}.th", map_location=device)
     model.eval()
 
     # -- either path maps raw logits to real-prior probabilities: the analytic
