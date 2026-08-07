@@ -274,7 +274,9 @@ def init_data_loader(
         batch_size=batch_size,
         shuffle=(split == 'train'),
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        # -- unpinned on purpose: WSL2 caps the pinned-host pool and prefetched
+        #    full-grid windows exhaust it; H2D copies are tiny next to zarr reads
+        pin_memory=False,
         persistent_workers=(num_workers > 0),
         generator=generator,
         worker_init_fn=_seed_worker if seed is not None else None,

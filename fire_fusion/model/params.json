@@ -75,7 +75,7 @@
     },
     "training": {
       "seed": 1,
-      "batch_size": 12,
+      "batch_size": 4,
       "epochs": [
         5,
         60,
@@ -121,7 +121,7 @@
     },
     "training": {
       "seed": 1,
-      "batch_size": 12,
+      "batch_size": 4,
       "epochs": [
         5,
         60,
@@ -167,7 +167,7 @@
     },
     "training": {
       "seed": 2,
-      "batch_size": 12,
+      "batch_size": 4,
       "epochs": [
         5,
         60,

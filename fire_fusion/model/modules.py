@@ -247,6 +247,7 @@ class WindowedSpatialAttention(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.window_size = window_size
+        self.attn_chunk = 32768
 
         self.pos_embed = nn.Parameter(torch.randn(window_size * window_size, embed_dim) * 0.02)
 
@@ -286,12 +287,18 @@ class WindowedSpatialAttention(nn.Module):
 
         x_w = x_windows
         x_norm = self.norm(x_windows) + self.pos_embed
-        # need_weights=False keeps the attention matrix unmaterialized
-        # ++ lets torch dispatch its fused kernels; the weights are discarded regardless
-        out, _ = self.window_attn(
-            x_norm, x_norm, x_norm, need_weights=False, key_padding_mask=pad_mask
-        )
-        out = self.proj(out) + x_w
+
+        # -- SDPA maps the window-batch axis onto a CUDA grid dimension capped at
+        #    65535; a full-grid batch exceeds it, so attention runs in chunks
+        outs = []
+        for i in range(0, x_norm.shape[0], self.attn_chunk):
+            chunk = x_norm[i:i + self.attn_chunk]
+            m = pad_mask[i:i + self.attn_chunk] if pad_mask is not None else None
+            # need_weights=False keeps the attention matrix unmaterialized
+            # ++ lets torch dispatch its fused kernels; the weights are discarded regardless
+            o, _ = self.window_attn(chunk, chunk, chunk, need_weights=False, key_padding_mask=m)
+            outs.append(o)
+        out = self.proj(torch.cat(outs, dim=0)) + x_w
 
         out = out.view(B*T, nH, nW, ws, ws, C).permute(0, 1, 3, 2, 4, 5)
         out = out.reshape(B*T, Hpad, Wpad, C)[:, :Hp, :Wp]
