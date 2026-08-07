@@ -275,6 +275,7 @@ class ConfusionMatrix(Metric):
         self,
         roc_auc: Optional[float] = None,
         pr_auc: Optional[float] = None,
+        recall_at_prev: Optional[float] = None,
     ) -> Dict[str, float]:
         """
         Compute metrics for the epoch, append to record, and reset internal storage.
@@ -294,6 +295,7 @@ class ConfusionMatrix(Metric):
                 "f1": 0.0,
                 "roc_auc": roc_auc,
                 "pr_auc": pr_auc,
+                "recall_at_prev": recall_at_prev,
             }
             self.record.append({**scores, "matrix": cm.copy()})
             self.reset()
@@ -321,6 +323,7 @@ class ConfusionMatrix(Metric):
             "f1": float(f1.mean()),
             "roc_auc": roc_auc,
             "pr_auc": pr_auc,
+            "recall_at_prev": recall_at_prev,
         }
 
         self.record.append({**scores, "matrix": cm.copy()})
@@ -428,7 +431,8 @@ class BinaryAUC(Metric):
         n_pos, n_neg = int(self.pos.sum()), int(self.neg.sum())
 
         if n_pos == 0 or n_neg == 0:
-            scores = {"roc_auc": float("nan"), "pr_auc": float("nan")}
+            scores = {"roc_auc": float("nan"), "pr_auc": float("nan"),
+                      "recall_at_prev": float("nan")}
             self.record.append(scores)
             self.reset()
             return scores
@@ -449,7 +453,14 @@ class BinaryAUC(Metric):
         # average precision: each threshold's precision weighted by the recall it adds
         pr_auc = float(np.sum(np.diff(r) * precision))
 
-        scores = {"roc_auc": roc_auc, "pr_auc": pr_auc}
+        # -- recall when exactly n_pos cells are alarmed: an operating point a
+        #    0.5 threshold never reaches at this prevalence. Rank-based, so any
+        #    monotone recalibration leaves it unchanged.
+        k = min(int(np.searchsorted(tp + fp, float(n_pos))), self.num_bins - 1)
+        recall_at_prev = float(recall[k])
+
+        scores = {"roc_auc": roc_auc, "pr_auc": pr_auc,
+                  "recall_at_prev": recall_at_prev}
         self.record.append(scores)
         self.reset()
 
@@ -702,8 +713,7 @@ class MetricsManager:
             f"Ignition (supervised cells) >> "
             f"PR-AUC: {ign_scores['pr_auc']:.5f}, "
             f"ROC-AUC: {ign_scores['roc_auc']:.4f}, "
-            f"F1: {ign_scores['f1']:.4f}, "
-            f"recall: {ign_scores['recall']:.4f}, "
+            f"recall@prev: {ign_scores['recall_at_prev']:.4f}, "
             f"ignorance (bits): {ign_bits:.4f}\n"
             f"         SCORE ({self.select_by}): {score:.5f}"
         )
@@ -716,7 +726,7 @@ class MetricsManager:
             "loss/eval_total": float(val_total), "loss/eval_ign": float(val_ign),
             "loss/eval_cause": float(val_cause),
             "ign/pr_auc": float(ign_scores["pr_auc"]), "ign/roc_auc": float(ign_scores["roc_auc"]),
-            "ign/f1": float(ign_scores["f1"]), "ign/recall": float(ign_scores["recall"]),
+            "ign/recall_at_prev": float(ign_scores["recall_at_prev"]),
             "ign/val_bits": float(ign_bits),
             "score": float(score),
         }

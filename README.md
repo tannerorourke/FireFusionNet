@@ -73,7 +73,7 @@ We train a two-path spatiotemporal ConvFormer: 26 dynamic channels (weather, lan
 
 ### Training
 
-Forest fire ignition is a heavily imbalanced target, dependent on resolution (the positive rate implies a pos_weight of 973.95 at 4 km and 2746.86 at 2 km). Instead of reweighting, we absorb it by using **unit-weight BCE** and subsampling negatives in the loss. This keeps ignition loss proper under extreme imbalance.
+Forest fire ignition is a heavily imbalanced target, dependent on resolution (the positive rate implies a pos_weight of 944.85 at 4 km and 2683.80 at 2 km). Instead of reweighting, we absorb it by using **unit-weight BCE** and subsampling negatives in the loss. This keeps ignition loss proper under extreme imbalance.
 
 ### Experiments
 

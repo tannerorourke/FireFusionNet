@@ -132,6 +132,7 @@ class WRMTrainer:
         self.base_lr = training_params["base_lr"]
         self.weight_decay = training_params["weight_decay"]
         self.grad_clip = training_params["grad_clip"]
+        self.accum_steps = int(training_params.get("accum_steps", 1))
 
         self.bcewl_loss = nn.BCEWithLogitsLoss(reduction="none")
 
@@ -280,7 +281,11 @@ class WRMTrainer:
         ep_cause_loss: float = 0.0
         n_samples: int = 0
 
-        for (x_dyn, x_static), golds, masks in tqdm(self.train_loader, desc="Training...", leave=False):
+        n_batches = len(self.train_loader)
+        self.optimizer.zero_grad(set_to_none=True)
+        for b_idx, ((x_dyn, x_static), golds, masks) in enumerate(
+            tqdm(self.train_loader, desc="Training...", leave=False)
+        ):
             x_dyn = x_dyn.to(self.device)
             x_static = x_static.to(self.device)
             golds = { k: v.to(self.device) for k, v in golds.items() }
@@ -292,8 +297,6 @@ class WRMTrainer:
                           f"min/max {t.min().item():.4f}/{t.max().item():.4f} "
                           f"mean/std {t.mean().item():.4f}/{t.std().item():.4f} "
                           f"nan={torch.isnan(t).sum().item()} inf={torch.isinf(t).sum().item()}")
-
-            self.optimizer.zero_grad(set_to_none=True)
 
             ign_golds, cause_golds, ign_mask, cause_mask = self._prepare_targets(golds, masks)
             loss_mask = self._thinned_mask(ign_golds, ign_mask)
@@ -321,11 +324,15 @@ class WRMTrainer:
                 masks =[ign_mask.detach().cpu(), cause_mask.detach().cpu()]
             )
 
-            # Backpropogate -> clip gradients -> step optimizer
-            tot_loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
-            self.optimizer.step()
-            self.scheduler.step()
+            # -- gradients accumulate over accum_steps micro-batches; the loss is
+            #    scaled so their sum matches one batch of accum_steps * batch_size.
+            #    Clip, step, and schedule fire once per accumulated batch.
+            (tot_loss / self.accum_steps).backward()
+            if (b_idx + 1) % self.accum_steps == 0 or (b_idx + 1) == n_batches:
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad(set_to_none=True)
 
         self.mm.add_epoch_totals("train",
             losses=np.array([ep_total_loss, ep_ign_loss, ep_cause_loss])
@@ -473,17 +480,21 @@ class WRMTrainer:
             lr=self.base_lr,
             weight_decay=self.weight_decay
         )
+        # -- the scheduler ticks once per optimizer step, not per micro-batch,
+        #    so its horizon shrinks by the accumulation factor
+        opt_steps_per_epoch = max(1, math.ceil(len(self.train_loader) / self.accum_steps))
         self.scheduler = WarmupCosineAnnealingLR(
             self.optimizer,
-            warmup_steps=self.ep_warmup * max(1, len(self.train_loader)),
-            total_steps=self.ep_max * max(1, len(self.train_loader)),
+            warmup_steps=self.ep_warmup * opt_steps_per_epoch,
+            total_steps=self.ep_max * opt_steps_per_epoch,
             min_lr=self.min_lr
         )
 
         print(f"Starting training with parameters:\n"
             f"- model size: {estimate_model_size_mb(self.model):.2f}mb\n",
             f"- epochs: {self.ep_warmup} (warmup) {self.ep_max} (total) {self.ep_early_stop} (early stop)\n",
-            f"- min lr: {self.min_lr}, base lr: {self.base_lr}, grad clip: {self.grad_clip}, weight decay: {self.weight_decay}\n",
+            f"- min lr: {self.min_lr}, base lr: {self.base_lr}, grad clip: {self.grad_clip}, "
+            f"weight decay: {self.weight_decay}, accum steps: {self.accum_steps}\n",
         )
 
         # best weights take the fixed name so --init-from can reference them; the
