@@ -46,6 +46,7 @@ class B2Store:
 
     def __init__(self, bucket: Optional[str] = None, endpoint: Optional[str] = None):
         import boto3
+        from botocore.config import Config
 
         endpoint = endpoint or os.environ["B2_ENDPOINT"]
         self.bucket = bucket or os.environ["B2_BUCKET"]
@@ -53,12 +54,15 @@ class B2Store:
         m = re.search(r"s3\.([^.]+)\.backblazeb2\.com", endpoint)
         region = m.group(1) if m else os.environ.get("B2_REGION", "us-east-005")
 
+        # -- B2 throttles bursty multi-GB transfers; standard-mode retries absorb
+        #    the resulting SlowDown and connection-reset errors instead of dying
         self.client = boto3.client(
             "s3",
             endpoint_url=endpoint,
             region_name=region,
             aws_access_key_id=os.environ["B2_KEY_ID"],
             aws_secret_access_key=os.environ["B2_APP_KEY"],
+            config=Config(retries={"max_attempts": 10, "mode": "standard"}),
         )
         self.client.head_bucket(Bucket=self.bucket)
 

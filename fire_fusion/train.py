@@ -619,6 +619,8 @@ if __name__ == "__main__":
                         help="freeze the backbone ('main') or the decoder ('heads')")
     parser.add_argument("--alpha-ign", type=float, default=None, help="ignition loss weight")
     parser.add_argument("--alpha-cause", type=float, default=None, help="cause loss weight")
+    parser.add_argument("--chunk-size", type=int, default=None,
+                        help="override channel_mixing.chunk_size (VRAM/throughput probe)")
     parser.add_argument("--export-b2", action="store_true",
                         help="upload final weights + calibrator to Backblaze B2 (B2_* env) when training ends")
     args = parser.parse_args()
@@ -634,6 +636,12 @@ if __name__ == "__main__":
 
     model_params        = params["model"]
     training_params     = params["training"]
+
+    # -- the attention chunk trades VRAM for kernel-launch count and is the one
+    #    knob probed per GPU rather than per experiment
+    if args.chunk_size is not None:
+        model_params["channel_mixing"]["chunk_size"] = args.chunk_size
+        print(f"[train] channel_mixing.chunk_size overridden to {args.chunk_size}")
 
     # -- a window read decompresses a whole time-chunk of the split zarr, so the
     #    loader is IO-bound before the GPU is. Each worker holds prefetched windows
