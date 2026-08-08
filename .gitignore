@@ -5,12 +5,10 @@ logs
 *.accdb
 *.7z
 *.tar.gz
+*.whl
 
-# Downloaded Data (~160gb), except the per-tier dataset cards.
+# Downloaded Data (~160gb)
 data/**
-!data/processed/
-!data/processed/*/
-!data/processed/*/README.md
 
 # training files
 *.th

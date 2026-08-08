@@ -19,7 +19,7 @@ As a case study, we train a spatiotemporal ConvFormer on the datacube to predict
 
 Four datacubes, available on HuggingFace, are the intended way to use this work.
 
-Each spans 2003-2020 and includes a raw `dataset.zarr` including normalized raw and derived features, as well as a `2003-2016`/`2017-2018`/`2019-2020` train/eval/test split, used in flagship model. The `wa****` datasets cover the full state. `cascades500` narrows to a 272 x 272 km (73,984 km$^2$) window over the eastern Cascades and Okanogan, the corridor holding the bulk of the state's USFS-recorded ignitions, useful for fine-tuning.
+Each includes a raw `dataset.zarr` including normalized raw and derived features, as well as a `2003-2016`/`2017-2018`/`2019-2020` chronological train/eval/test split, used in flagship model. The `wa****` datasets cover the full state. `cascades500` narrows to a 272 x 272 km (73,984 km$^2$) window over the eastern Cascades and Okanogan, the corridor holding the bulk of the state's USFS-recorded ignitions, useful for fine-tuning.
 
 | Dataset | Resolution | Grid (y, x) | Coverage | Dataset |
 | --- | --- | --- | --- | --- |
