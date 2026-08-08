@@ -427,6 +427,7 @@ class TemporalMixingAttention(nn.Module):
         # being predicted from regardless of how long the window is
         self.time_embed = nn.Parameter(torch.randn(max_window, embed_dim) * 0.02)
         self.max_window = max_window
+        self.attn_chunk = 32768
 
         self.norm = nn.LayerNorm(embed_dim)
 
@@ -462,8 +463,14 @@ class TemporalMixingAttention(nn.Module):
         # pre-norm: each sub-block normalizes its own input and leaves the
         # residual stream itself untouched, with a LayerNorm per sub-block
         x_norm = self.norm(x)
-        out_attn, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
-        x = x + out_attn
+        # -- SDPA maps the pixel-batch axis onto a CUDA grid dimension capped at
+        #    65535; a full-grid batch exceeds it, so attention runs in chunks
+        outs = []
+        for i in range(0, x_norm.shape[0], self.attn_chunk):
+            chunk = x_norm[i:i + self.attn_chunk]
+            o, _ = self.attn(chunk, chunk, chunk, need_weights=False)
+            outs.append(o)
+        x = x + torch.cat(outs, dim=0)
 
         out_ffn = self.mlp(self.norm2(x))
         x = x + out_ffn
